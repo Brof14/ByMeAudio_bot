@@ -4,16 +4,12 @@ import time
 import html
 import logging
 import sqlite3
-import tempfile
+import io
 import asyncio
 import threading
-import glob
-import wave
-import io
-from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
-import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,11 +28,17 @@ from telegram.error import Conflict, TelegramError
 #  ЛОГИРОВАНИЕ
 # ══════════════════════════════════════════════════════════
 
+# ВАЖНО: httpx/telegram на уровне INFO печатали каждый getUpdates вместе
+# с токеном бота в открытом виде и раздували bot.log без ограничения.
+for _noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "apscheduler", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        # Ротация: лог не растёт бесконечно и не съедает диск VPS.
+        RotatingFileHandler("bot.log", maxBytes=512 * 1024, backupCount=1, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -53,320 +55,264 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в файле .env")
 
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip() or None
+ADMIN_SET = set(ADMIN_IDS)
 
 MAX_FILE_SIZE_MB = 20  # Ограничение Telegram Bot API на getFile
 DB_PATH = "audio_bot.db"
+
+# ── Параметры распознавания (тюнинг скорости) ──────────────────
+# WHISPER_MODEL: tiny (~75 МБ, быстрее) | base (~145 МБ, точнее, по умолчанию)
+# WHISPER_BEAM_SIZE: 1 = greedy (самый быстрый), 3/5 = точнее и медленнее
+# WHISPER_CPU_THREADS: 0 = авто (число ядер VPS), ручное значение переопределяет
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+WHISPER_BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1") or 1))
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0") or 0)
 
 # ══════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
 # ══════════════════════════════════════════════════════════
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# Одно долгоживущее соединение вместо connect()/close() на каждый вызов:
+# меньше системных вызовов, блокировок файла и повторных PRAGMA на каждый апдейт.
+_conn: sqlite3.Connection | None = None
+
+
+def get_conn() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA cache_size=-2000")  # ограничить кэш страниц БД
+    return _conn
 
 
 def init_db():
-    with get_db() as conn:
-        # Создание таблицы пользователей
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id                 INTEGER PRIMARY KEY,
-                username                TEXT,
-                first_name              TEXT,
-                total_conversions       INTEGER DEFAULT 0,
-                total_voice             INTEGER DEFAULT 0,
-                total_video             INTEGER DEFAULT 0,
-                total_audio             INTEGER DEFAULT 0,
-                created_at              TEXT    DEFAULT CURRENT_TIMESTAMP,
-                last_active             TEXT    DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    conn = get_conn()
+    # Создание таблицы пользователей
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id                 INTEGER PRIMARY KEY,
+            username                TEXT,
+            first_name              TEXT,
+            total_conversions       INTEGER DEFAULT 0,
+            total_voice             INTEGER DEFAULT 0,
+            total_video             INTEGER DEFAULT 0,
+            total_audio             INTEGER DEFAULT 0,
+            created_at              TEXT    DEFAULT CURRENT_TIMESTAMP,
+            last_active             TEXT    DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-        # Миграция колонок, если таблица была создана ранее в старой версии
-        cursor = conn.execute("PRAGMA table_info(users)")
-        existing_cols = {row["name"] for row in cursor.fetchall()}
+    # Миграция колонок, если таблица была создана ранее в старой версии
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
 
-        needed_cols = {
-            "first_name": "TEXT",
-            "total_conversions": "INTEGER DEFAULT 0",
-            "total_voice": "INTEGER DEFAULT 0",
-            "total_video": "INTEGER DEFAULT 0",
-            "total_audio": "INTEGER DEFAULT 0",
-            "last_active": "TEXT",
-        }
+    needed_cols = {
+        "first_name": "TEXT",
+        "total_conversions": "INTEGER DEFAULT 0",
+        "total_voice": "INTEGER DEFAULT 0",
+        "total_video": "INTEGER DEFAULT 0",
+        "total_audio": "INTEGER DEFAULT 0",
+        "last_active": "TEXT",
+    }
 
-        for col_name, col_def in needed_cols.items():
-            if col_name not in existing_cols:
-                conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
-                logger.info("Миграция БД: добавлена колонка %s", col_name)
+    for col_name, col_def in needed_cols.items():
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+            logger.info("Миграция БД: добавлена колонка %s", col_name)
 
-        # Удаление неиспользуемой таблицы транзакций от оплат
-        conn.execute("DROP TABLE IF EXISTS transactions")
+    # Удаление неиспользуемой таблицы транзакций от оплат
+    conn.execute("DROP TABLE IF EXISTS transactions")
+    conn.commit()
 
     logger.info("База данных инициализирована успешно.")
 
 
-def ensure_user(user_id: int, username: str | None, first_name: str | None) -> dict:
-    username = username or ""
-    first_name = first_name or ""
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO users (user_id, username, first_name, last_active)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_active = CURRENT_TIMESTAMP
-        """, (user_id, username, first_name))
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return dict(row) if row else {}
+def ensure_user(user_id: int, username: str | None, first_name: str | None) -> None:
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO users (user_id, username, first_name, last_active)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_active = CURRENT_TIMESTAMP
+    """, (user_id, username or "", first_name or ""))
+    conn.commit()
 
 
 def record_conversion(user_id: int, username: str | None, first_name: str | None, media_type: str):
     v_voice = 1 if media_type == "voice" else 0
     v_video = 1 if media_type == "video" else 0
     v_audio = 1 if media_type == "audio" else 0
-    username = username or ""
-    first_name = first_name or ""
 
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO users (
-                user_id, username, first_name,
-                total_conversions, total_voice, total_video, total_audio,
-                last_active
-            )
-            VALUES (?, ?, ?, 1, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                total_conversions = total_conversions + 1,
-                total_voice = total_voice + excluded.total_voice,
-                total_video = total_video + excluded.total_video,
-                total_audio = total_audio + excluded.total_audio,
-                last_active = CURRENT_TIMESTAMP
-        """, (user_id, username, first_name, v_voice, v_video, v_audio))
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO users (
+            user_id, username, first_name,
+            total_conversions, total_voice, total_video, total_audio,
+            last_active
+        )
+        VALUES (?, ?, ?, 1, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            total_conversions = total_conversions + 1,
+            total_voice = total_voice + excluded.total_voice,
+            total_video = total_video + excluded.total_video,
+            total_audio = total_audio + excluded.total_audio,
+            last_active = CURRENT_TIMESTAMP
+    """, (user_id, username or "", first_name or "", v_voice, v_video, v_audio))
+    conn.commit()
 
 
 def get_user_stats(user_id: int) -> dict:
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return dict(row) if row else {}
+    row = get_conn().execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return dict(row) if row else {}
 
 
 def get_global_stats() -> dict:
-    with get_db() as conn:
-        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total = conn.execute("SELECT COALESCE(SUM(total_conversions), 0) FROM users").fetchone()[0]
-        voice = conn.execute("SELECT COALESCE(SUM(total_voice), 0) FROM users").fetchone()[0]
-        video = conn.execute("SELECT COALESCE(SUM(total_video), 0) FROM users").fetchone()[0]
-        audio = conn.execute("SELECT COALESCE(SUM(total_audio), 0) FROM users").fetchone()[0]
-        return {
-            "users": users,
-            "total": total,
-            "voice": voice,
-            "video": video,
-            "audio": audio,
-        }
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT COUNT(*)                                        AS users,
+               COALESCE(SUM(total_conversions), 0)              AS total,
+               COALESCE(SUM(total_voice), 0)                    AS voice,
+               COALESCE(SUM(total_video), 0)                    AS video,
+               COALESCE(SUM(total_audio), 0)                    AS audio
+        FROM users
+    """).fetchone()
+    return dict(row)
 
 
 def get_all_user_ids() -> list[int]:
-    with get_db() as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-        return [row["user_id"] for row in rows]
+    rows = get_conn().execute("SELECT user_id FROM users").fetchall()
+    return [row["user_id"] for row in rows]
 
 
 # ══════════════════════════════════════════════════════════
-#  КОНВЕРТАЦИЯ МЕДИА (FFmpeg)
+#  ДВИЖОК РАСПОЗНАВАНИЯ РЕЧИ (Faster-Whisper, локально)
 # ══════════════════════════════════════════════════════════
 
-async def extract_audio_to_wav(input_path: str, output_wav_path: str) -> bool:
+class Transcriber:
     """
-    Быстрое неблокирующее извлечение звука через FFmpeg.
-    Конвертирует любой входящий формат (.ogg, .mp4, .mp3, .m4a, .mov и т.д.)
-    в 16kHz mono 16-bit PCM WAV — идеальный формат для распознавания речи.
-    """
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-vn",                   # отключаем видеопоток
-        "-acodec", "pcm_s16le",  # PCM 16-bit
-        "-ar", "16000",          # 16 kHz
-        "-ac", "1",              # моно
-        output_wav_path,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error("Ошибка FFmpeg (код %d): %s", proc.returncode, stderr.decode(errors="ignore"))
-            return False
-        return True
-    except Exception as e:
-        logger.error("Исключение при вызове FFmpeg: %s", e)
-        return False
+    Локальный офлайн-транскрайбер на faster-whisper (CTranslate2, int8, CPU).
 
-
-def get_wav_duration(wav_path: str) -> float:
-    """Быстро получает длительность WAV из заголовка."""
-    try:
-        with wave.open(wav_path, "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            return frames / float(rate) if rate > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def format_duration(seconds: float | int) -> str:
-    """Форматирует длительность в формат MM:SS или HH:MM:SS."""
-    seconds = int(round(seconds))
-    if seconds < 0:
-        seconds = 0
-    mins = seconds // 60
-    secs = seconds % 60
-    if mins >= 60:
-        hours = mins // 60
-        mins = mins % 60
-        return f"{hours}:{mins:02d}:{secs:02d}"
-    return f"{mins}:{secs:02d}"
-
-
-# ══════════════════════════════════════════════════════════
-#  ДВИЖОК РАСПОЗНАВАНИЯ РЕЧИ (Transcriber)
-# ══════════════════════════════════════════════════════════
-
-class SpeechTranscriber:
-    """
-    Интеллектуальный транскрибер:
-    1. Groq Cloud API (whisper-large-v3-turbo, ~0.3-0.8с, пунктуация) — если задан GROQ_API_KEY
-    2. Faster-Whisper Base (локально на CPU int8, ~1-2с, оффлайн, пунктуация, без ограничений длины)
-    3. Google Speech API (бесплатный сетевой резерв с нарезкой длинных фрагментов)
+    Аудио НЕ конвертируется заранее: PyAV (встроенный в faster-whisper)
+    декодирует ogg/opus, mp4, mp3, m4a, wav, flaс и т.д. прямо в память
+    и сам ресемплит в 16 кГц моно. Никаких временных файлов, никакого
+    внешнего ffmpeg, никаких сетевых запросов.
     """
 
-    def __init__(self, groq_api_key: str | None = None):
-        self.groq_api_key = groq_api_key
-        self.groq_client = None
-        if self.groq_api_key:
-            try:
-                from groq import Groq
-                self.groq_client = Groq(api_key=self.groq_api_key)
-                logger.info("⚡ Groq API успешно инициализирован (Whisper Large v3 Turbo)")
-            except Exception as e:
-                logger.warning("Не удалось инициализировать Groq client: %s", e)
-
-        self._local_model = None
+    def __init__(self, model_size: str, beam_size: int, cpu_threads: int):
+        self.model_size = model_size
+        self.beam_size = beam_size
+        self.cpu_threads = cpu_threads
+        self._model = None
         self._model_lock = threading.Lock()
 
-    def get_local_model(self):
-        """Ленивая загрузка локальной модели Faster-Whisper."""
+    def get_model(self):
+        """Ленивая загрузка модели (один раз за процесс)."""
+        if self._model is not None:
+            return self._model
+
         with self._model_lock:
-            if self._local_model is not None:
-                return self._local_model
+            if self._model is not None:
+                return self._model
 
             from faster_whisper import WhisperModel
 
-            snapshots = glob.glob(
-                os.path.expanduser("~/.cache/huggingface/hub/models--Systran--faster-whisper-base/snapshots/*")
+            t = time.perf_counter()
+            self._model = WhisperModel(
+                self.model_size,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=self.cpu_threads,
             )
-            if snapshots:
-                cached_path = snapshots[0]
-                logger.info("Загрузка Faster-Whisper из локального кэша: %s", cached_path)
-                self._local_model = WhisperModel(
-                    cached_path,
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=4,
-                    local_files_only=True,
-                )
-            else:
-                logger.info("Загрузка Faster-Whisper base модели...")
-                self._local_model = WhisperModel(
-                    "base",
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=4,
-                )
-            return self._local_model
-
-    def transcribe(self, wav_path: str) -> tuple[str, str]:
-        """
-        Выполняет распознавание аудио.
-        Возвращает (текст, название_движка).
-        """
-        # ── 1. Groq Cloud Whisper (быстрейший и самый точный) ──
-        if self.groq_client:
-            try:
-                with open(wav_path, "rb") as f:
-                    transcription = self.groq_client.audio.transcriptions.create(
-                        file=f,
-                        model="whisper-large-v3-turbo",
-                        response_format="json",
-                        temperature=0.0,
-                    )
-                text = transcription.text.strip()
-                if text:
-                    return text, "Groq Whisper Large"
-            except Exception as e:
-                logger.warning("Groq API вернул ошибку, переключаюсь на локальный Whisper: %s", e)
-
-        # ── 2. Faster-Whisper (локально, бесплатно, качественно) ──
-        try:
-            model = self.get_local_model()
-            segments, info = model.transcribe(
-                wav_path,
-                beam_size=5,
-                condition_on_previous_text=False,
-                vad_filter=False,  # отключено для избежания сетевых запросов к silero
-                no_speech_threshold=0.6,
+            logger.info(
+                "Whisper '%s' (int8, cpu_threads=%d) загружена за %.2f с",
+                self.model_size, self.cpu_threads, time.perf_counter() - t,
             )
-            parts = []
-            for s in segments:
-                if s.no_speech_prob < 0.65:
-                    clean = s.text.strip()
-                    if clean.lower() not in {"you", "you.", "thank you", "thank you.", "thanks.", "thanks", "[blank_audio]"}:
-                        parts.append(clean)
+            return self._model
 
-            text = " ".join(parts).strip()
-            if text:
-                lang_tag = f"Faster-Whisper ({info.language})"
-                return text, lang_tag
-        except Exception as e:
-            logger.warning("Локальный Whisper вернул ошибку: %s. Переключаюсь на Google Speech.", e)
-
-        # ── 3. Google Speech API (резервный) ──
+    def warmup(self):
+        """
+        Фоновая прогревка при старте: загрузка модели + прогон через VAD,
+        чтобы silero-VAD не подгружался во время первого реального сообщения.
+        """
         try:
-            import speech_recognition as sr
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data, language="ru-RU")
-            if text:
-                return text.strip(), "Google Speech"
+            self.get_model()
+            from faster_whisper.vad import get_vad_model
+            get_vad_model()
+            logger.info("Прогрев распознавания завершён")
         except Exception as e:
-            logger.info("Google Speech не распознал речь (тишина или ошибка): %s", e)
+            logger.warning("Не удалось прогреть модель: %s", e)
 
-        return "", "None"
+    @staticmethod
+    def _is_hallucination(text: str) -> bool:
+        """
+        Отсекает вырожденные сегменты-зацикливания вида «о, о, о, о, о…»,
+        которые Whisper генерирует на тишине/шуме. Проверка обобщённая:
+        один и тот же короткий токен, повторённый много раз подряд.
+        """
+        words = text.split()
+        if len(words) < 8:
+            return False
+        first = words[0].lower()
+        short = len(first) <= 4
+        return short and all(w.lower() == first for w in words)
+
+    def transcribe_bytes(self, data: bytes) -> tuple[str, str]:
+        """data — исходные байты файла из Telegram. Возвращает (текст, движок)."""
+        from faster_whisper.audio import decode_audio
+
+        model = self.get_model()
+
+        # Декодирование + ресемплинг 16 кГц моно в оперативную память.
+        audio = decode_audio(io.BytesIO(data))
+        if audio.size == 0:
+            return "", "Faster-Whisper"
+
+        segments, info = model.transcribe(
+            audio,
+            beam_size=self.beam_size,               # 1 = greedy: в разы быстрее beam=5
+            temperature=0.0,                        # ровно один проход декодирования
+            vad_filter=True,                        # локальный silero: режет тишину
+            vad_parameters={
+                # threshold НЕ трогаем: занижение пропускает в декодер шум,
+                # no_speech_prob взлетает до ~0.95 и весь текст теряется.
+                "min_silence_duration_ms": 300,
+                "max_speech_duration_s": 30,        # ограничивает пик памяти на длинных файлах
+            },
+            condition_on_previous_text=False,       # без «залипания» на предыдущем тексте
+            no_speech_threshold=0.6,
+        )
+
+        parts = []
+        for seg in segments:
+            if seg.no_speech_prob >= 0.65:
+                continue
+            clean = seg.text.strip()
+            if clean and not self._is_hallucination(clean):
+                parts.append(clean)
+
+        text = " ".join(parts).strip()
+        return text, f"Faster-Whisper {self.model_size} ({info.language})"
 
 
-transcriber = SpeechTranscriber(groq_api_key=GROQ_API_KEY)
+transcriber = Transcriber(WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
+
+# Транскрипция CPU-bound: выполняем строго по одному файлу, чтобы не
+# перегружать ядра VPS, но при этом event loop остаётся свободным
+# (бот мгновенно отвечает на /stats, кнопки и т.п. во время расшифровки).
+_asr_semaphore: asyncio.Semaphore | None = None
+
+
+def asr_slot() -> asyncio.Semaphore:
+    global _asr_semaphore
+    if _asr_semaphore is None:
+        _asr_semaphore = asyncio.Semaphore(1)
+    return _asr_semaphore
 
 
 # ══════════════════════════════════════════════════════════
@@ -512,7 +458,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = get_user_stats(uid)
-    is_admin = uid in set(ADMIN_IDS)
+    is_admin = uid in ADMIN_SET
 
     user_name = update.effective_user.first_name or "Пользователь"
     total_conv = u.get("total_conversions", 0)
@@ -547,8 +493,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Рассылка сообщения всем пользователям бота (только для админов)."""
-    uid = update.effective_user.id
-    if uid not in set(ADMIN_IDS):
+    if update.effective_user.id not in ADMIN_SET:
         return
 
     if not context.args:
@@ -570,9 +515,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
             )
             success += 1
-            await asyncio.sleep(0.05)  # Защита от лимитов Telegram
         except Exception:
             failed += 1
+        await asyncio.sleep(0.05)  # Защита от лимитов Telegram
 
     await update.message.reply_text(
         f"✅ <b>Рассылка завершена!</b>\n"
@@ -586,83 +531,81 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  ХЕНДЛЕРЫ — ОБРАБОТКА МЕДИА (ГОЛОС / КРУЖКИ / АУДИО)
 # ══════════════════════════════════════════════════════════
 
+AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".aac", ".oga", ".opus", ".amr", ".wma")
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg", ".3gp")
+
+
+def detect_media(msg) -> dict | None:
+    """Определяет тип входящего медиа. Возвращает описание или None."""
+    if msg.voice:
+        return dict(obj=msg.voice, kind="voice", media="voice", icon="🎙",
+                    title="Голосовое сообщение",
+                    prompt="🎧 Слушаю и перевожу голосовое в текст…",
+                    duration=msg.voice.duration or 0, size=msg.voice.file_size or 0)
+    if msg.video_note:
+        return dict(obj=msg.video_note, kind="video", media="video", icon="📹",
+                    title="Видео-сообщение (кружок)",
+                    prompt="📹 Извлекаю звук из кружка и перевожу в текст…",
+                    duration=msg.video_note.duration or 0, size=msg.video_note.file_size or 0)
+    if msg.audio:
+        return dict(obj=msg.audio, kind="audio", media="audio", icon="🎵",
+                    title=f"Аудио: {msg.audio.file_name or 'Аудиозапись'}",
+                    prompt="🎵 Обрабатываю аудиофайл…",
+                    duration=msg.audio.duration or 0, size=msg.audio.file_size or 0)
+    if msg.video:
+        return dict(obj=msg.video, kind="video", media="video", icon="🎬",
+                    title="Видеофайл",
+                    prompt="🎬 Извлекаю звук из видео и перевожу в текст…",
+                    duration=msg.video.duration or 0, size=msg.video.file_size or 0)
+    if msg.document:
+        doc = msg.document
+        mime = (doc.mime_type or "").lower()
+        name = (doc.file_name or "").lower()
+        is_audio = mime.startswith("audio/") or name.endswith(AUDIO_EXTS)
+        is_video = mime.startswith("video/") or name.endswith(VIDEO_EXTS)
+        if not (is_audio or is_video):
+            return None
+        return dict(obj=doc, kind="doc", media="audio" if is_audio else "video",
+                    icon="🎵" if is_audio else "🎬",
+                    title=f"Файл: {doc.file_name or 'Аудио'}",
+                    prompt="📁 Извлекаю аудиодорожку из файла…",
+                    duration=getattr(doc, "duration", None) or 0, size=doc.file_size or 0)
+    return None
+
+
+def format_duration(seconds: float | int) -> str:
+    """Форматирует длительность в формат MM:SS или HH:MM:SS."""
+    seconds = int(round(seconds))
+    if seconds < 0:
+        seconds = 0
+    mins = seconds // 60
+    secs = seconds % 60
+    if mins >= 60:
+        hours = mins // 60
+        mins = mins % 60
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins}:{secs:02d}"
+
+
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
     if not msg or not user:
         return
 
+    # Регистрируем пользователя сразу (как и раньше), чтобы /stats
+    # показывал дату первого запуска даже до первой успешной расшифровки.
     ensure_user(user.id, user.username, user.first_name)
 
-    # Определение типа входящего медиа
-    file_obj = None
-    media_type = "voice"
-    icon = "🎙"
-    title = "Голосовое сообщение"
-    status_prompt = "🎧 Слушаю и перевожу голосовое в текст…"
-    duration = 0
-    file_size = 0
-
-    if msg.voice:
-        file_obj = msg.voice
-        media_type = "voice"
-        icon = "🎙"
-        title = "Голосовое сообщение"
-        status_prompt = "🎧 Слушаю и перевожу голосовое в текст…"
-        duration = msg.voice.duration or 0
-        file_size = msg.voice.file_size or 0
-
-    elif msg.video_note:
-        file_obj = msg.video_note
-        media_type = "video"
-        icon = "📹"
-        title = "Видео-сообщение (кружок)"
-        status_prompt = "📹 Извлекаю звук из кружка и перевожу в текст…"
-        duration = msg.video_note.duration or 0
-        file_size = msg.video_note.file_size or 0
-
-    elif msg.audio:
-        file_obj = msg.audio
-        media_type = "audio"
-        icon = "🎵"
-        fname = msg.audio.file_name or "Аудиозапись"
-        title = f"Аудио: {fname}"
-        status_prompt = "🎵 Обрабатываю аудиофайл…"
-        duration = msg.audio.duration or 0
-        file_size = msg.audio.file_size or 0
-
-    elif msg.video:
-        file_obj = msg.video
-        media_type = "video"
-        icon = "🎬"
-        title = "Видеофайл"
-        status_prompt = "🎬 Извлекаю звук из видео и перевожу в текст…"
-        duration = msg.video.duration or 0
-        file_size = msg.video.file_size or 0
-
-    elif msg.document:
-        doc = msg.document
-        mime = (doc.mime_type or "").lower()
-        fname = (doc.file_name or "").lower()
-        is_audio = mime.startswith("audio/") or any(fname.endswith(ext) for ext in [".mp3", ".ogg", ".wav", ".m4a", ".flac", ".aac", ".oga"])
-        is_video = mime.startswith("video/") or any(fname.endswith(ext) for ext in [".mp4", ".mov", ".mkv", ".avi", ".webm"])
-
-        if is_audio or is_video:
-            file_obj = doc
-            media_type = "audio" if is_audio else "video"
-            icon = "🎵" if is_audio else "🎬"
-            title = f"Файл: {doc.file_name or 'Аудио'}"
-            status_prompt = "📁 Извлекаю аудиодорожку из файла…"
-            file_size = doc.file_size or 0
-        else:
-            return
-    else:
+    info = detect_media(msg)
+    if info is None:
         return
+    file_obj = info["obj"]
 
     # Проверка размера файла (Telegram Bot API limit = 20MB)
-    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+    if info["size"] > MAX_FILE_SIZE_MB * 1024 * 1024:
         await msg.reply_text(
-            f"⚠️ <b>Файл слишком большой</b> ({file_size / (1024 * 1024):.1f} МБ).\n"
+            f"⚠️ <b>Файл слишком большой</b> ({info['size'] / (1024 * 1024):.1f} МБ).\n"
             f"Telegram Bot API разрешает ботам загружать файлы до {MAX_FILE_SIZE_MB} МБ.",
             parse_mode=ParseMode.HTML,
         )
@@ -670,93 +613,63 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Отправка статуса и действия
     await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-    status_msg = await msg.reply_text(status_prompt)
+    status_msg = await msg.reply_text(info["prompt"])
 
     try:
         tg_file = await file_obj.get_file()
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            input_ext = ".tmp"
-            if media_type == "voice":
-                input_ext = ".ogg"
-            elif media_type == "video":
-                input_ext = ".mp4"
-            elif msg.audio and msg.audio.file_name:
-                input_ext = os.path.splitext(msg.audio.file_name)[1] or ".mp3"
+        # Файл скачивается сразу в память. На диск он не попадает вообще.
+        data = await tg_file.download_as_bytearray()
+        del tg_file
 
-            input_path = os.path.join(tmp_dir, f"input{input_ext}")
-            wav_path = os.path.join(tmp_dir, "extracted.wav")
+        t_start = time.perf_counter()
+        async with asr_slot():
+            text, engine_name = await asyncio.to_thread(transcriber.transcribe_bytes, bytes(data))
+            data = None  # освобождаем память сразу после обработки
+        elapsed = time.perf_counter() - t_start
 
-            # Скачивание файла
-            await tg_file.download_to_drive(input_path)
-
-            # Извлечение звука через FFmpeg
-            extracted_ok = await extract_audio_to_wav(input_path, wav_path)
-            if not extracted_ok or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-                await status_msg.edit_text(
-                    "❌ <b>Не удалось извлечь звук из файла.</b>\n"
-                    "Проверьте, что в файле присутствует корректная звуковая дорожка.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            # Вычисление фактической длительности звука
-            calc_dur = get_wav_duration(wav_path)
-            actual_dur = duration if duration > 0 else calc_dur
-            dur_formatted = format_duration(actual_dur)
-
-            # Распознавание в отдельном потоке (без блокировки event loop)
-            t_start = time.time()
-            text, engine_name = await asyncio.to_thread(transcriber.transcribe, wav_path)
-            elapsed = time.time() - t_start
-
-            if not text:
-                await status_msg.edit_text(
-                    "❌ <b>Не удалось разобрать речь.</b>\n\n"
-                    "Возможные причины:\n"
-                    "• В записи тишина или играет только музыка\n"
-                    "• Слишком сильные посторонние шумы\n"
-                    "• Слишком тихий голос\n\n"
-                    "Попробуйте записать ещё раз ближе к микрофону.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            # Учёт конвертации в БД
-            record_conversion(
-                user_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
-                media_type=media_type,
+        if not text:
+            await status_msg.edit_text(
+                "❌ <b>Не удалось разобрать речь.</b>\n\n"
+                "Возможные причины:\n"
+                "• В записи тишина или играет только музыка\n"
+                "• Слишком сильные посторонние шумы\n"
+                "• Слишком тихий голос\n\n"
+                "Попробуйте записать ещё раз ближе к микрофону.",
+                parse_mode=ParseMode.HTML,
             )
+            return
 
-            # Форматирование и экранирование
-            escaped_text = html.escape(text)
-            stats_footer = f"⏱ {elapsed:.1f} сек | ⏳ {dur_formatted} | ⚡ {engine_name}"
+        # Учёт конвертации в БД
+        record_conversion(user.id, user.username, user.first_name, info["media"])
 
-            # Разбивка текста, если превышает лимит Telegram (4096 символов)
-            chunks = split_message_text(escaped_text, max_chunk_size=3800)
+        # Форматирование и экранирование
+        dur_formatted = format_duration(info["duration"])
+        stats_footer = f"⏱ {elapsed:.1f} сек | ⏳ {dur_formatted} | ⚡ {engine_name}"
 
-            first_text = (
-                f"{icon} <b>{html.escape(title)}</b>\n\n"
-                f"{chunks[0]}\n\n"
-                f"📊 <i>{stats_footer}</i>"
+        # Разбивка текста, если превышает лимит Telegram (4096 символов)
+        chunks = split_message_text(html.escape(text), max_chunk_size=3800)
+
+        first_text = (
+            f"{info['icon']} <b>{html.escape(info['title'])}</b>\n\n"
+            f"{chunks[0]}\n\n"
+            f"📊 <i>{stats_footer}</i>"
+        )
+
+        await status_msg.edit_text(first_text, parse_mode=ParseMode.HTML)
+
+        # Если текст очень длинный — досылаем оставшиеся части
+        for chunk in chunks[1:]:
+            await msg.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+        # Если текст огромный (> 10 000 символов), дополнительно прикрепляем текстовый файл
+        if len(text) > 10000:
+            bio = io.BytesIO(text.encode("utf-8"))
+            bio.name = f"transcript_{int(time.time())}.txt"
+            await msg.reply_document(
+                document=bio,
+                caption="📄 Полный текст расшифровки в файле",
             )
-
-            await status_msg.edit_text(first_text, parse_mode=ParseMode.HTML)
-
-            # Если текст очень длинный — досылаем оставшиеся части
-            for chunk in chunks[1:]:
-                await msg.reply_text(chunk, parse_mode=ParseMode.HTML)
-
-            # Если текст огромный (> 10 000 символов), дополнительно прикрепляем текстовый файл
-            if len(text) > 10000:
-                bio = io.BytesIO(text.encode("utf-8"))
-                bio.name = f"transcript_{int(time.time())}.txt"
-                await msg.reply_document(
-                    document=bio,
-                    caption="📄 Полный текст расшифровки в файле",
-                )
 
     except TelegramError as e:
         logger.error("Telegram API ошибка при обработке медиа uid=%s: %s", user.id, e)
@@ -764,7 +677,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ Ошибка отправки результата. Попробуйте ещё раз.")
         except Exception:
             pass
-    except Exception as e:
+    except Exception:
         logger.exception("Непредвиденная ошибка при обработке медиа uid=%s", user.id)
         try:
             await status_msg.edit_text("❌ Произошла ошибка при обработке файла. Попробуйте ещё раз.")
@@ -783,7 +696,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
 
     if data == "back_to_menu":
-        name = user.first_name or "друг"
         text = (
             f"👋 <b>Главное меню</b>\n\n"
             f"Отправьте мне любое голосовое сообщение, видео-кружок или аудиофайл — "
@@ -807,36 +719,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "my_stats":
         u = get_user_stats(user.id)
-        total_conv = u.get("total_conversions", 0)
-        total_voice = u.get("total_voice", 0)
-        total_video = u.get("total_video", 0)
-        total_audio = u.get("total_audio", 0)
-        created_at = u.get("created_at", "—")
-
         text = (
             f"📊 <b>Ваша статистика:</b>\n\n"
-            f"🎙 Голосовых: <b>{total_voice}</b>\n"
-            f"📹 Кружков: <b>{total_video}</b>\n"
-            f"🎵 Аудиофайлов: <b>{total_audio}</b>\n"
-            f"📝 Всего переведено: <b>{total_conv}</b>\n"
-            f"📅 Дата первого запуска: <code>{created_at}</code>\n\n"
+            f"🎙 Голосовых: <b>{u.get('total_voice', 0)}</b>\n"
+            f"📹 Кружков: <b>{u.get('total_video', 0)}</b>\n"
+            f"🎵 Аудиофайлов: <b>{u.get('total_audio', 0)}</b>\n"
+            f"📝 Всего переведено: <b>{u.get('total_conversions', 0)}</b>\n"
+            f"📅 Дата первого запуска: <code>{u.get('created_at', '—')}</code>\n\n"
             f"💎 Тариф: <b>Бесплатный навсегда 🚀</b>"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
         return
 
     elif data == "about":
-        engine_desc = "Whisper AI (локально)"
-        if GROQ_API_KEY:
-            engine_desc = "Groq Whisper Large v3 Turbo (ультрабыстрый)"
-
         text = (
             f"⚡ <b>О возможностях бота:</b>\n\n"
-            f"• 🧠 <b>Движок распознавания:</b> {engine_desc}\n"
+            f"• 🧠 <b>Движок распознавания:</b> Faster-Whisper {WHISPER_MODEL} (локально, офлайн)\n"
             f"• 🎙 <b>Поддержка голоса:</b> OGG, OPUS, MP3, WAV, M4A, AAC, FLAC\n"
             f"• 📹 <b>Поддержка видео:</b> Telegram видео-сообщения (кружки), MP4, MOV\n"
             f"• ✍️ <b>Качество:</b> автоматическая расстановка запятых, точек и заглавных букв\n"
-            f"• ⚡ <b>Скорость:</b> извлечение звука через FFmpeg за доли секунды\n"
+            f"• ⚡ <b>Скорость:</b> звук декодируется прямо из файла, без конвертаций\n"
             f"• 🆓 <b>Полная свобода:</b> никаких подписок, оплат и лимитов!"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
@@ -844,7 +746,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════
-#  ОБРАБОТКА ОШИБОК И ЗАВЕРШЕНИЕ
+#  ОБРАБОТКА ОШИБОК
 # ══════════════════════════════════════════════════════════
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -854,41 +756,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Необработанное исключение:", exc_info=context.error)
 
 
-def force_cleanup_webhook():
-    """Сбрасывает webhook и очищает очередь старых апдейтов перед стартом polling."""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        resp = requests.post(url, json={"drop_pending_updates": True}, timeout=10)
-        if resp.status_code == 200:
-            logger.info("✅ Webhook успешно сброшен, старые апдейты очищены")
-        else:
-            logger.warning("Ответ Telegram при удалении webhook: %s", resp.text)
-    except Exception as e:
-        logger.warning("Не удалось выполнить запрос сброса webhook: %s", e)
-
-
 # ══════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА (MAIN)
 # ══════════════════════════════════════════════════════════
 
 def main():
     init_db()
-    force_cleanup_webhook()
 
-    # Предзагрузка модели Faster-Whisper в фоновом потоке для мгновенного первого ответа
-    threading.Thread(target=transcriber.get_local_model, daemon=True, name="whisper_warmup").start()
+    # Предзагрузка модели в фоне: первый апдейт не ждёт инициализацию.
+    threading.Thread(target=transcriber.warmup, daemon=True, name="whisper_warmup").start()
 
-    # Построение Telegram приложения с адекватным rate-limiter
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .rate_limiter(
-            AIORateLimiter(
-                overall_max_rate=30,
-                overall_time_period=1,
-                max_retries=3,
-            )
-        )
+        .rate_limiter(AIORateLimiter(overall_max_rate=30, overall_time_period=1, max_retries=3))
+        # Апдейты обрабатываются параллельно: во время расшифровки аудио бот
+        # продолжает отвечать на команды, кнопки и показывает «печатает…».
+        # 8 — верхняя граница одновременных задач, чтобы при флуде не удерживать
+        # в памяти сотни скачанных файлов (True превратился бы в 256).
+        .concurrent_updates(8)
+        # Скачивание файлов: увеличенные таймауты убирают бесполезные
+        # ретраи и обрывы на медленном канале к Telegram.
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .pool_timeout(30)
         .build()
     )
 
@@ -898,7 +790,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    # Обработка всех типов аудио и видео: голосовые, видео-сообщения (кружки), аудиофайлы, видеофайлы
+    # Голосовые, видео-кружки, аудио- и видеофайлы, а также документы
     media_filter = (
         filters.VOICE
         | filters.VIDEO_NOTE
@@ -916,13 +808,18 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info("🚀 Бот успешно настроен и готов к работе!")
-    logger.info("Администраторы: %s | Groq: %s", ADMIN_IDS, "Включён" if GROQ_API_KEY else "Отключён (локальный Whisper)")
+    logger.info("Администраторы: %s | Модель: %s (beam=%d, cpu_threads=%d)",
+                ADMIN_IDS, WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
+
+    # Только те типы апдейтов, которые бот реально обрабатывает:
+    # меньше трафика и JSON-парсинга на каждый long-poll.
+    allowed_updates = [
+        "message", "callback_query", "my_chat_member", "chat_member",
+        "chat_join_request", "poll", "poll_answer",
+    ]
 
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
+        application.run_polling(allowed_updates=allowed_updates, drop_pending_updates=True)
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
