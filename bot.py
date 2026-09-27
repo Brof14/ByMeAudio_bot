@@ -7,6 +7,7 @@ import sqlite3
 import io
 import asyncio
 import threading
+import re
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -58,14 +59,14 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 ADMIN_SET = set(ADMIN_IDS)
 
 MAX_FILE_SIZE_MB = 20  # Ограничение Telegram Bot API на getFile
-DB_PATH = "audio_bot.db"
+DB_PATH = "/app/data/audio_bot.db" if os.path.exists("/app/data") else "audio_bot.db"
 
-# ── Параметры распознавания (тюнинг скорости) ──────────────────
-# WHISPER_MODEL: tiny (~75 МБ, быстрее) | base (~145 МБ, точнее, по умолчанию)
-# WHISPER_BEAM_SIZE: 1 = greedy (самый быстрый), 3/5 = точнее и медленнее
-# WHISPER_CPU_THREADS: 0 = авто (число ядер VPS), ручное значение переопределяет
+# ── Параметры распознавания (оптимизированы для скорости, точности и качества) ──
+# WHISPER_MODEL: tiny (~75 МБ, быстро) | base (~145 МБ, точнее, по умолчанию)
+# WHISPER_BEAM_SIZE: 1-3 (1 = быстро, 3 = точнее, оптимум 2-3)
+# WHISPER_CPU_THREADS: 0 = авто (число ядер VPS), вручную ограничивает нагрузку
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
-WHISPER_BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1") or 1))
+WHISPER_BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "2") or 2))
 WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0") or 0)
 
 # ══════════════════════════════════════════════════════════
@@ -80,6 +81,11 @@ _conn: sqlite3.Connection | None = None
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
+        # Создаём директорию если её нет
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        
         _conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
@@ -199,7 +205,7 @@ class Transcriber:
     Локальный офлайн-транскрайбер на faster-whisper (CTranslate2, int8, CPU).
 
     Аудио НЕ конвертируется заранее: PyAV (встроенный в faster-whisper)
-    декодирует ogg/opus, mp4, mp3, m4a, wav, flaс и т.д. прямо в память
+    декодирует ogg/opus, mp4, mp3, m4a, wav, flac и т.д. прямо в память
     и сам ресемплит в 16 кГц моно. Никаких временных файлов, никакого
     внешнего ffmpeg, никаких сетевых запросов.
     """
@@ -262,6 +268,33 @@ class Transcriber:
         short = len(first) <= 4
         return short and all(w.lower() == first for w in words)
 
+    @staticmethod
+    def _post_process_text(text: str) -> str:
+        """
+        Post-processing: исправляет частые ошибки Whisper, улучшает читаемость.
+        """
+        if not text:
+            return text
+
+        # Убираем двойные пробелы
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Исправляем пробелы перед пунктуацией (если она оторвалась)
+        text = re.sub(r'\s+([?.!,;:\)\]\}])', r'\1', text)
+        
+        # Добавляем пробел после пунктуации если его нет
+        text = re.sub(r'([.!?:,;])([\w«\(])', r'\1 \2', text)
+        
+        # Убираем лишние пробелы в начале и конце
+        text = text.strip()
+        
+        # Капитализация после точки (для русского)
+        def capitalize_after_punct(match):
+            return match.group(1) + match.group(2) + match.group(3).upper() + match.group(4)
+        text = re.sub(r'([.!?])\s+([«]?)([а-яё])', capitalize_after_punct, text)
+        
+        return text
+
     def transcribe_bytes(self, data: bytes) -> tuple[str, str]:
         """data — исходные байты файла из Telegram. Возвращает (текст, движок)."""
         from faster_whisper.audio import decode_audio
@@ -275,21 +308,22 @@ class Transcriber:
 
         segments, info = model.transcribe(
             audio,
-            beam_size=self.beam_size,               # 1 = greedy: в разы быстрее beam=5
-            temperature=0.0,                        # ровно один проход декодирования
-            vad_filter=True,                        # локальный silero: режет тишину
+            beam_size=self.beam_size,                      # Оптимизированный beam_size (2-3)
+            temperature=[0.0, 0.1, 0.2],                   # Multi-pass для баланса скорости и точности
+            vad_filter=True,                               # локальный silero: режет тишину
             vad_parameters={
-                # threshold НЕ трогаем: занижение пропускает в декодер шум,
-                # no_speech_prob взлетает до ~0.95 и весь текст теряется.
                 "min_silence_duration_ms": 300,
-                "max_speech_duration_s": 30,        # ограничивает пик памяти на длинных файлах
+                "max_speech_duration_s": 30,
+                "padding_duration_ms": 100,                # Дополнительный padding для лучшего контекста
             },
-            condition_on_previous_text=False,       # без «залипания» на предыдущем тексте
-            no_speech_threshold=0.6,
+            condition_on_previous_text=False,              # без «залипания» на предыдущем тексте
+            no_speech_threshold=0.55,                      # Более строгий порог для отсева шума
+            language="ru",                                 # Явно указываем русский язык для лучшего распознавания
         )
 
         parts = []
         for seg in segments:
+            # Пропускаем сегменты с высокой вероятностью "не речь"
             if seg.no_speech_prob >= 0.65:
                 continue
             clean = seg.text.strip()
@@ -297,6 +331,10 @@ class Transcriber:
                 parts.append(clean)
 
         text = " ".join(parts).strip()
+        
+        # Post-processing для улучшения качества
+        text = self._post_process_text(text)
+        
         return text, f"Faster-Whisper {self.model_size} ({info.language})"
 
 
@@ -446,7 +484,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отправьте кружок — бот извлечёт аудиодорожку и расшифрует её без потери качества.\n\n"
         f"3️⃣ <b>Аудио и видео файлы:</b>\n"
         f"Поддерживаются файлы MP3, M4A, OGG, WAV, MP4 и др. размером до 20 МБ.\n\n"
-        f"💡 <b>Совет:</b> старайтесь говорить без сильного ветра или постороннего фонового шума для идеальной точности.\n\n"
+        f"💡 <b>Совет:</b> старайтесь говорить без сильного ветра или постороннего фонового шума для лучшего результата.\n\n"
         f"⚡ <b>Команды:</b>\n"
         f"/start — главное меню\n"
         f"/help — эта инструкция\n"
@@ -700,7 +738,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 <b>Главное меню</b>\n\n"
             f"Отправьте мне любое голосовое сообщение, видео-кружок или аудиофайл — "
             f"и я мгновенно переведу его в текст.\n\n"
-            f"Бот полностью бесплатный и без ограничений! 🚀"
+            f"Бот полностью бесплатный и без ограничений! ����"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main_menu())
         return
@@ -751,7 +789,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        logger.warning("Конфликт getUpdates: возможно запущен другой экземпляр бота.")
+        logger.warning("Конфликт getUpdates: возможно запущен другой ��кземпляр бота.")
         return
     logger.error("Необработанное исключение:", exc_info=context.error)
 
