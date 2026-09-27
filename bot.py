@@ -81,22 +81,20 @@ _conn: sqlite3.Connection | None = None
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        # Создаём директорию если её нет
         db_dir = os.path.dirname(DB_PATH)
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
-        
+
         _conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
-        _conn.execute("PRAGMA cache_size=-2000")  # ограничить кэш страниц БД
+        _conn.execute("PRAGMA cache_size=-2000")
     return _conn
 
 
 def init_db():
     conn = get_conn()
-    # Создание таблицы пользователей
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id                 INTEGER PRIMARY KEY,
@@ -111,9 +109,7 @@ def init_db():
         )
     """)
 
-    # Миграция колонок, если таблица была создана ранее в старой версии
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-
     needed_cols = {
         "first_name": "TEXT",
         "total_conversions": "INTEGER DEFAULT 0",
@@ -128,10 +124,8 @@ def init_db():
             conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
             logger.info("Миграция БД: добавлена колонка %s", col_name)
 
-    # Удаление неиспользуемой таблицы транзакций от оплат
     conn.execute("DROP TABLE IF EXISTS transactions")
     conn.commit()
-
     logger.info("База данных инициализирована успешно.")
 
 
@@ -181,11 +175,11 @@ def get_user_stats(user_id: int) -> dict:
 def get_global_stats() -> dict:
     conn = get_conn()
     row = conn.execute("""
-        SELECT COUNT(*)                                        AS users,
-               COALESCE(SUM(total_conversions), 0)              AS total,
-               COALESCE(SUM(total_voice), 0)                    AS voice,
-               COALESCE(SUM(total_video), 0)                    AS video,
-               COALESCE(SUM(total_audio), 0)                    AS audio
+        SELECT COUNT(*) AS users,
+               COALESCE(SUM(total_conversions), 0) AS total,
+               COALESCE(SUM(total_voice), 0) AS voice,
+               COALESCE(SUM(total_video), 0) AS video,
+               COALESCE(SUM(total_audio), 0) AS audio
         FROM users
     """).fetchone()
     return dict(row)
@@ -203,11 +197,6 @@ def get_all_user_ids() -> list[int]:
 class Transcriber:
     """
     Локальный офлайн-транскрайбер на faster-whisper (CTranslate2, int8, CPU).
-
-    Аудио НЕ конвертируется заранее: PyAV (встроенный в faster-whisper)
-    декодирует ogg/opus, mp4, mp3, m4a, wav, flac и т.д. прямо в память
-    и сам ресемплит в 16 кГц моно. Никаких временных файлов, никакого
-    внешнего ffmpeg, никаких сетевых запросов.
     """
 
     def __init__(self, model_size: str, beam_size: int, cpu_threads: int):
@@ -218,7 +207,6 @@ class Transcriber:
         self._model_lock = threading.Lock()
 
     def get_model(self):
-        """Ленивая загрузка модели (один раз за процесс)."""
         if self._model is not None:
             return self._model
 
@@ -235,17 +223,11 @@ class Transcriber:
                 compute_type="int8",
                 cpu_threads=self.cpu_threads,
             )
-            logger.info(
-                "Whisper '%s' (int8, cpu_threads=%d) загружена за %.2f с",
-                self.model_size, self.cpu_threads, time.perf_counter() - t,
-            )
+            logger.info("Whisper '%s' (int8, cpu_threads=%d) загружена за %.2f с",
+                        self.model_size, self.cpu_threads, time.perf_counter() - t)
             return self._model
 
     def warmup(self):
-        """
-        Фоновая прогревка при старте: загрузка модели + прогон через VAD,
-        чтобы silero-VAD не подгружался во время первого реального сообщения.
-        """
         try:
             self.get_model()
             from faster_whisper.vad import get_vad_model
@@ -256,93 +238,101 @@ class Transcriber:
 
     @staticmethod
     def _is_hallucination(text: str) -> bool:
-        """
-        Отсекает вырожденные сегменты-зацикливания вида «о, о, о, о, о…»,
-        которые Whisper генерирует на тишине/шуме. Проверка обобщённая:
-        один и тот же короткий токен, повторённый много раз подряд.
-        """
         words = text.split()
-        if len(words) < 8:
+        if len(words) < 6:
             return False
         first = words[0].lower()
-        short = len(first) <= 4
-        return short and all(w.lower() == first for w in words)
+        if len(first) > 5:
+            return False
+        return all(w.lower() == first for w in words)
 
     @staticmethod
-    def _post_process_text(text: str) -> str:
-        """
-        Post-processing: исправляет частые ошибки Whisper, улучшает читаемость.
-        """
+    def _normalize_russian_text(text: str) -> str:
         if not text:
             return text
 
-        # Убираем двойные пробелы
-        text = re.sub(r'\s+', ' ', text)
-        
-        # Исправляем пробелы перед пунктуацией (если она оторвалась)
-        text = re.sub(r'\s+([?.!,;:\)\]\}])', r'\1', text)
-        
-        # Добавляем пробел после пунктуации если его нет
-        text = re.sub(r'([.!?:,;])([\w«\(])', r'\1 \2', text)
-        
-        # Убираем лишние пробелы в начале и конце
         text = text.strip()
-        
-        # Капитализация после точки (для русского)
-        def capitalize_after_punct(match):
-            return match.group(1) + match.group(2) + match.group(3).upper() + match.group(4)
-        text = re.sub(r'([.!?])\s+([«]?)([а-яё])', capitalize_after_punct, text)
-        
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+        text = re.sub(r"([,.!?;:])([A-Za-zА-Яа-я])", r"\1 \2", text)
+        text = re.sub(r"([.!?])\s+([«\(\[]?)([а-яё])", lambda m: f"{m.group(1)} {m.group(2)}{m.group(3).upper()}", text)
+
+        text = re.sub(r"\.{3,}", "...", text)
+        text = re.sub(r"(\.{2,})\s+([,.!?;:])", r"\2", text)
+
+        # Удаляем слишком длинные повторения слов, которые возникают на фоне шума
+        words = text.split()
+        clean = []
+        prev = None
+        prev_count = 0
+        for w in words:
+            w_norm = w.lower()
+            if w_norm == prev:
+                prev_count += 1
+                if prev_count <= 2:
+                    clean.append(w)
+            else:
+                prev = w_norm
+                prev_count = 1
+                clean.append(w)
+
+        text = " ".join(clean)
+        text = re.sub(r"\s+([)\]}>])", r"\1", text)
+        return text.strip()
+
+    @staticmethod
+    def _collapse_short_gaps(text: str) -> str:
+        text = re.sub(r"\b(\w+)\s+(\1\s+){2,}", r"\1 ", text, flags=re.IGNORECASE)
         return text
 
     def transcribe_bytes(self, data: bytes) -> tuple[str, str]:
-        """data — исходные байты файла из Telegram. Возвращает (текст, движок)."""
         from faster_whisper.audio import decode_audio
 
         model = self.get_model()
-
-        # Декодирование + ресемплинг 16 кГц моно в оперативную память.
         audio = decode_audio(io.BytesIO(data))
         if audio.size == 0:
             return "", "Faster-Whisper"
 
         segments, info = model.transcribe(
             audio,
-            beam_size=self.beam_size,                      # Оптимизированный beam_size (2-3)
-            temperature=[0.0, 0.1, 0.2],                   # Multi-pass для баланса скорости и точности
-            vad_filter=True,                               # локальный silero: режет тишину
+            beam_size=self.beam_size,
+            best_of=2,
+            temperature=[0.0, 0.1, 0.2],
+            vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 300,
                 "max_speech_duration_s": 30,
-                "padding_duration_ms": 100,                # Дополнительный padding для лучшего контекста
+                "padding_duration_ms": 100,
             },
-            condition_on_previous_text=False,              # без «залипания» на предыдущем тексте
-            no_speech_threshold=0.55,                      # Более строгий порог для отсева шума
-            language="ru",                                 # Явно указываем русский язык для лучшего распознавания
+            condition_on_previous_text=False,
+            no_speech_threshold=0.55,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            language="ru",
+            task="transcribe",
         )
 
         parts = []
         for seg in segments:
-            # Пропускаем сегменты с высокой вероятностью "не речь"
             if seg.no_speech_prob >= 0.65:
                 continue
             clean = seg.text.strip()
-            if clean and not self._is_hallucination(clean):
+            if not clean:
+                continue
+            if self._is_hallucination(clean):
+                continue
+            clean = self._normalize_russian_text(clean)
+            if clean:
                 parts.append(clean)
 
         text = " ".join(parts).strip()
-        
-        # Post-processing для улучшения качества
-        text = self._post_process_text(text)
-        
+        text = self._collapse_short_gaps(text)
+        text = self._normalize_russian_text(text)
         return text, f"Faster-Whisper {self.model_size} ({info.language})"
 
 
 transcriber = Transcriber(WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
 
-# Транскрипция CPU-bound: выполняем строго по одному файлу, чтобы не
-# перегружать ядра VPS, но при этом event loop остаётся свободным
-# (бот мгновенно отвечает на /stats, кнопки и т.п. во время расшифровки).
 _asr_semaphore: asyncio.Semaphore | None = None
 
 
@@ -358,10 +348,6 @@ def asr_slot() -> asyncio.Semaphore:
 # ══════════════════════════════════════════════════════════
 
 def split_message_text(text: str, max_chunk_size: int = 3800) -> list[str]:
-    """
-    Разбивает длинный текст на части не более max_chunk_size,
-    сохраняя целостность абзацев и предложений.
-    """
     if len(text) <= max_chunk_size:
         return [text]
 
@@ -428,7 +414,6 @@ def split_message_text(text: str, max_chunk_size: int = 3800) -> list[str]:
 # ══════════════════════════════════════════════════════════
 
 def kb_main_menu() -> InlineKeyboardMarkup:
-    """Главное меню."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("ℹ️ Как пользоваться", callback_data="help"),
@@ -441,7 +426,6 @@ def kb_main_menu() -> InlineKeyboardMarkup:
 
 
 def kb_back_to_menu() -> InlineKeyboardMarkup:
-    """Кнопка возврата в меню."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("← Назад в меню", callback_data="back_to_menu")]
     ])
@@ -468,11 +452,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 🆓 <b>100% бесплатно и без ограничений!</b>\n\n"
         f"👉 <i>Просто отправь или перешли мне голосовое или кружок:</i>"
     )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_main_menu(),
-    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main_menu())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,7 +510,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Рассылка сообщения всем пользователям бота (только для админов)."""
     if update.effective_user.id not in ADMIN_SET:
         return
 
@@ -544,18 +523,13 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success = 0
     failed = 0
-
     for target_id in user_ids:
         try:
-            await context.bot.send_message(
-                chat_id=target_id,
-                text=broadcast_text,
-                parse_mode=ParseMode.HTML,
-            )
+            await context.bot.send_message(chat_id=target_id, text=broadcast_text, parse_mode=ParseMode.HTML)
             success += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.05)  # Защита от лимитов Telegram
+        await asyncio.sleep(0.05)
 
     await update.message.reply_text(
         f"✅ <b>Рассылка завершена!</b>\n"
@@ -574,7 +548,6 @@ VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg", ".3gp")
 
 
 def detect_media(msg) -> dict | None:
-    """Определяет тип входящего медиа. Возвращает описание или None."""
     if msg.voice:
         return dict(obj=msg.voice, kind="voice", media="voice", icon="🎙",
                     title="Голосовое сообщение",
@@ -612,7 +585,6 @@ def detect_media(msg) -> dict | None:
 
 
 def format_duration(seconds: float | int) -> str:
-    """Форматирует длительность в формат MM:SS или HH:MM:SS."""
     seconds = int(round(seconds))
     if seconds < 0:
         seconds = 0
@@ -631,8 +603,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not user:
         return
 
-    # Регистрируем пользователя сразу (как и раньше), чтобы /stats
-    # показывал дату первого запуска даже до первой успешной расшифровки.
     ensure_user(user.id, user.username, user.first_name)
 
     info = detect_media(msg)
@@ -640,7 +610,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     file_obj = info["obj"]
 
-    # Проверка размера файла (Telegram Bot API limit = 20MB)
     if info["size"] > MAX_FILE_SIZE_MB * 1024 * 1024:
         await msg.reply_text(
             f"⚠️ <b>Файл слишком большой</b> ({info['size'] / (1024 * 1024):.1f} МБ).\n"
@@ -649,21 +618,18 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Отправка статуса и действия
     await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
     status_msg = await msg.reply_text(info["prompt"])
 
     try:
         tg_file = await file_obj.get_file()
-
-        # Файл скачивается сразу в память. На диск он не попадает вообще.
         data = await tg_file.download_as_bytearray()
         del tg_file
 
         t_start = time.perf_counter()
         async with asr_slot():
             text, engine_name = await asyncio.to_thread(transcriber.transcribe_bytes, bytes(data))
-            data = None  # освобождаем память сразу после обработки
+            data = None
         elapsed = time.perf_counter() - t_start
 
         if not text:
@@ -678,16 +644,11 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Учёт конвертации в БД
         record_conversion(user.id, user.username, user.first_name, info["media"])
-
-        # Форматирование и экранирование
         dur_formatted = format_duration(info["duration"])
         stats_footer = f"⏱ {elapsed:.1f} сек | ⏳ {dur_formatted} | ⚡ {engine_name}"
 
-        # Разбивка текста, если превышает лимит Telegram (4096 символов)
         chunks = split_message_text(html.escape(text), max_chunk_size=3800)
-
         first_text = (
             f"{info['icon']} <b>{html.escape(info['title'])}</b>\n\n"
             f"{chunks[0]}\n\n"
@@ -696,18 +657,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(first_text, parse_mode=ParseMode.HTML)
 
-        # Если текст очень длинный — досылаем оставшиеся части
         for chunk in chunks[1:]:
             await msg.reply_text(chunk, parse_mode=ParseMode.HTML)
 
-        # Если текст огромный (> 10 000 символов), дополнительно прикрепляем текстовый файл
         if len(text) > 10000:
             bio = io.BytesIO(text.encode("utf-8"))
             bio.name = f"transcript_{int(time.time())}.txt"
-            await msg.reply_document(
-                document=bio,
-                caption="📄 Полный текст расшифровки в файле",
-            )
+            await msg.reply_document(document=bio, caption="📄 Полный текст расшифровки в файле")
 
     except TelegramError as e:
         logger.error("Telegram API ошибка при обработке медиа uid=%s: %s", user.id, e)
@@ -738,7 +694,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 <b>Главное меню</b>\n\n"
             f"Отправьте мне любое голосовое сообщение, видео-кружок или аудиофайл — "
             f"и я мгновенно переведу его в текст.\n\n"
-            f"Бот полностью бесплатный и без ограничений! ����"
+            f"Бот полностью бесплатный и без ограничений! 🚀"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main_menu())
         return
@@ -789,7 +745,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        logger.warning("Конфликт getUpdates: возможно запущен другой ��кземпляр бота.")
+        logger.warning("Конфликт getUpdates: возможно запущен другой экземпляр бота.")
         return
     logger.error("Необработанное исключение:", exc_info=context.error)
 
@@ -800,21 +756,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     init_db()
-
-    # Предзагрузка модели в фоне: первый апдейт не ждёт инициализацию.
     threading.Thread(target=transcriber.warmup, daemon=True, name="whisper_warmup").start()
 
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .rate_limiter(AIORateLimiter(overall_max_rate=30, overall_time_period=1, max_retries=3))
-        # Апдейты обрабатываются параллельно: во время расшифровки аудио бот
-        # продолжает отвечать на команды, кнопки и показывает «печатает…».
-        # 8 — верхняя граница одновременных задач, чтобы при флуде не удерживать
-        # в памяти сотни скачанных файлов (True превратился бы в 256).
         .concurrent_updates(8)
-        # Скачивание файлов: увеличенные таймауты убирают бесполезные
-        # ретраи и обрывы на медленном канале к Telegram.
         .read_timeout(60)
         .write_timeout(60)
         .connect_timeout(30)
@@ -822,13 +770,11 @@ def main():
         .build()
     )
 
-    # Регистрация команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    # Голосовые, видео-кружки, аудио- и видеофайлы, а также документы
     media_filter = (
         filters.VOICE
         | filters.VIDEO_NOTE
@@ -838,19 +784,13 @@ def main():
         | filters.Document.VIDEO
     )
     application.add_handler(MessageHandler(media_filter, handle_media))
-
-    # Обработка кнопок
     application.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Обработчик ошибок
     application.add_error_handler(error_handler)
 
     logger.info("🚀 Бот успешно настроен и готов к работе!")
     logger.info("Администраторы: %s | Модель: %s (beam=%d, cpu_threads=%d)",
                 ADMIN_IDS, WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
 
-    # Только те типы апдейтов, которые бот реально обрабатывает:
-    # меньше трафика и JSON-парсинга на каждый long-poll.
     allowed_updates = [
         "message", "callback_query", "my_chat_member", "chat_member",
         "chat_join_request", "poll", "poll_answer",
