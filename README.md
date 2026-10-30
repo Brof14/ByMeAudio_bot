@@ -1,193 +1,64 @@
-# 🎙 ByMeAudio Bot
+# ByMeAudio Bot
 
-Быстрый, полностью бесплатный и безлимитный Telegram-бот для мгновенного перевода в текст:
-- 🎙 **Голосовых сообщений** (`.ogg` / Opus)
-- 📹 **Видео-кружков** (`.mp4` / Video Notes)
-- 🎵 **Аудиофайлов** (MP3, WAV, M4A, FLAC, AAC, OGA)
-- 🎬 **Видеофайлов** (MP4, MOV, MKV — извлечение звука)
+A Telegram bot that transcribes voice messages, video notes, audio files, and video files with **Faster-Whisper** running locally on the bot host.
 
-Никаких оплат, тарифов, подписок и ограничений по количеству переводов!
+## Features
 
----
+- Accepts Telegram voice messages, video notes, common audio formats, and video files with an audio track.
+- Runs transcription locally on CPU using Faster-Whisper and CTranslate2; audio is not sent to an external transcription API.
+- Splits long transcripts into Telegram-sized messages.
+- Handles transcription outside the update loop so the bot can continue responding to commands.
+- Provides per-user usage statistics with `/stats`; administrator commands include broadcasts.
 
-## ⚡ Особенности и возможности
+The default model and performance depend on your server's CPU and memory. This is a self-hosted project, not a hosted service or an uptime guarantee.
 
-- **100% Бесплатно навсегда:** вся система оплат (ЮKassa, Telegram Stars, балансы, лимиты) удалена.
-- **Полностью офлайн:** распознавание идёт локально на CPU. Никаких внешних API, облачных ключей и LLM.
-- **Ноль промежуточных файлов:** аудио скачивается в оперативную память и декодируется напрямую (PyAV встроен в `faster-whisper`).
-- **Поддержка кружков:** аудиодорожка видео-сообщения извлекается автоматически.
-- **Качественное распознавание:** **Faster-Whisper** (CTranslate2, `int8`) расставляет знаки препинания и заглавные буквы, оптимизирована поддержка русского языка.
-- **Поддержка длинных аудио:** бот аккуратно разбивает длинные расшифровки на части (лимит Telegram 4096 символов на сообщение).
-- **Неблокирующая архитектура:** распознавание вынесено в отдельный поток, апдейты обрабатываются параллельно — бот мгновенно отвечает на кнопки и команды во время работы.
-- **Статистика:** подсчёт персональной статистики по каждому пользователю (`/stats`) и сводная статистика для администраторов.
-- **Рассылка:** администраторы могут делать рассылку объявлений по пользователям бота командой `/broadcast <текст>`.
+## Requirements
 
----
-
-## 🛠 Установка и запуск
-
-### 1. Требования
 - Python 3.10+
-- **FFmpeg не нужен** — он уже встроен в `faster-whisper` (PyAV)
+- Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Docker and Docker Compose for the container deployment
 
-### 2. Установка зависимостей
+## Run with Docker Compose
 
-В виртуальном окружении:
-```bash
-# Создание venv (если не создано)
-python3 -m venv venv
-# или через uv:
-# uv venv venv
-
-# Активация
-source venv/bin/activate
-
-# Установка библиотек
-pip install -r requirements.txt
-```
-
-### 3. Настройка `.env`
-Создайте или отредактируйте файл `.env`:
-```ini
-# Токен бота от @BotFather (обязательно)
-BOT_TOKEN=ваш_токен_бота
-
-# Telegram ID администраторов через запятую
-ADMIN_IDS=12345678, 87654321
-```
-
-### 3.1 Необязательные настройки скорости
-
-По умолчанию подобрана конфигурация «максимально быстро и точно». Менять нужно, только
-если захотите Trade-off между скоростью и точностью:
-
-```ini
-# tiny (~75 МБ, быстрее) | base (~145 МБ, точнее, по умолчанию)
-WHISPER_MODEL=base
-
-# 1 = greedy (быстро), 2 = баланс (рекомендуется), 3/5 = точнее и медленнее
-WHISPER_BEAM_SIZE=2
-
-# 0 = авто (число ядер VPS). Раньше жёстко стояло 4,
-# что на 2-ядерном VPS давало перегрузку и замедление.
-WHISPER_CPU_THREADS=0
-```
-
-> **Важно:** файл `.env` не должен попадать в git. Если он уже был закоммичен,
-> токен утечёт — **отзовите его через @BotFather** и выпустите новый.
-
-### 4. Запуск бота
-
-```bash
-python bot.py
-```
-или с использованием venv:
-```bash
-./venv/bin/python bot.py
-```
-
----
-
-### 4.1 🐳 Docker / VPS deployment
-
-Если бот запускается на VPS или сервере, удобнее использовать Docker. В этом случае база данных хранится в отдельном volume, чтобы не теряться после перезапуска контейнера.
-
-**Пошаговая установка на VPS:**
-
-```bash
-# 1) Клонируем репозиторий
-cd /root
-git clone https://github.com/Brof14/ByMeAudio_bot.git
-cd /root/ByMeAudio_bot
-
-# 2) Создаём .env из шаблона
+```sh
 cp .env.example .env
-nano .env
 ```
 
-Заполните файл так:
-```ini
-BOT_TOKEN=ВАШ_ТОКЕН_БОТА
-ADMIN_IDS=ВАШ_TELEGRAM_ID
+Set `BOT_TOKEN` and `ADMIN_IDS` in `.env`, then:
 
-WHISPER_MODEL=base
-WHISPER_BEAM_SIZE=2
-WHISPER_CPU_THREADS=0
-```
-
-> `GROQ_API_KEY` можно не заполнять — текущая версия бота работает локально через `Faster-Whisper` и не использует Groq.
-
-```bash
-# 3) Устанавливаем права доступа и запускаем контейнер
+```sh
 chmod 600 .env
 docker compose up -d --build
-```
-
-**Полезные команды:**
-
-Просмотр статуса контейнеров:
-```bash
-docker compose ps
-```
-
-Просмотр логов в реальном времени:
-```bash
 docker compose logs -f bot
 ```
 
-Остановка контейнера:
-```bash
+The Compose setup keeps the SQLite database and downloaded model cache in Docker volumes. To stop the bot:
+
+```sh
 docker compose down
 ```
 
-Перезапуск после обновления кода:
-```bash
-docker compose up -d --build
-```
+For local development, create a virtual environment, install `requirements.txt`, configure `.env`, and run `python bot.py`. See the Compose file and `.env.example` for the configuration supported by this checkout.
 
-**Как это работает:**
+## Bot commands
 
-- 🗄️ **Путь к БД:** в контейнере задан как `/app/data/audio_bot.db`, а volume `bot_data` монтируется в `/app/data`, поэтому SQLite не теряется при пересборке или перезапуске контейнера.
-- 🤖 **Кэш моделей:** volume `whisper_cache` монтируется в `/root/.cache/huggingface`, чтобы Whisper-модели не скачивались заново при перезапусках.
-- 🔄 **Автоперезапуск:** директива `restart: unless-stopped` гарантирует, что бот вернётся в работу после сбоя или перезагрузки сервера.
+| Command | Description |
+| --- | --- |
+| `/start` | Open the main menu |
+| `/help` | Show usage instructions |
+| `/stats` | Show usage statistics |
+| `/broadcast <text>` | Send an announcement (administrators only) |
 
----
+## Configuration
 
-### 4.2 📦 Обновление бота с GitHub
+- `BOT_TOKEN` — required Telegram bot token
+- `ADMIN_IDS` — comma-separated Telegram user IDs with administrator access
+- `WHISPER_MODEL` — transcription model; the repository default is `base`
+- `WHISPER_BEAM_SIZE` — decoding beam size
+- `WHISPER_CPU_THREADS` — CPU thread count; `0` selects automatically
 
-Если в репозитории произведены обновления и вы хотите их применить на VPS:
+Never commit `.env`. If a real bot token was ever committed or shared, revoke it through BotFather and issue a replacement.
 
-```bash
-# 1) Переходим в директорию бота
-cd /root/ByMeAudio_bot
+## Notes
 
-# 2) Скачиваем обновления с GitHub
-git pull origin main
-
-# 3) Пересобираем Docker-контейнер с новым кодом
-docker compose up -d --build
-```
-
-**Проверить статус и логи:**
-
-```bash
-# Статус контейнеров
-docker compose ps
-
-# Логи в реальном времени
-docker compose logs -f bot
-
-# Если нужно остановить перед обновлением
-docker compose down
-```
-
-> **Важно:** файл `.env` не будет перезаписан при `git pull`, так как он в `.gitignore`. Если нужны новые переменные окружения, они будут описаны в коммите обновления или в новом `.env.example`.
-
----
-
-## 📱 Команды бота
-
-- `/start` — Главное меню с описанием и кнопками навигации.
-- `/help` — Подробная инструкция по отправке голосовых и кружков.
-- `/stats` — Ваша статистика переводов (и статистика бота для администраторов).
-- `/broadcast <сообщение>` — *(Только для админов)* Рассылка сообщения всем пользователям бота.
+Transcription quality and latency vary with the model, language, audio quality, and server hardware. Obtain permission before processing other people's recordings and follow Telegram's rules and applicable privacy requirements.
