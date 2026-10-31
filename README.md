@@ -100,7 +100,7 @@ after confirmation; `/broadcast <text>`: private administrator announcement.
   interrupted by a process restart are not automatically resumed, although pending
   Telegram updates are no longer deliberately dropped.
 - Only run one polling instance per token. SQLite is suitable for a small bot.
-- `python -m pip install -r requirements-dev.txt && pytest -q && ruff check .`
+- `python -m pip install -r requirements-dev.txt && python -m pytest -q && ruff check .`
   runs the CI checks. Tests stub recognition; they do **not** download a model.
 - Backup the SQLite database using the SQLite backup API, not a plain copy of a
   live WAL-enabled database. Backup the named volume to external storage.

@@ -28,4 +28,4 @@ jobs:
       - name: Critical lint rules
         run: ruff check .
       - name: Unit tests
-        run: pytest -q
+        run: python -m pytest -q
