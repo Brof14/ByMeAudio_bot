@@ -1,0 +1,21 @@
+services:
+  bot:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/audio_bot.db
+      LOG_PATH: /app/data/bot.log
+      HF_HOME: /app/cache
+      XDG_CACHE_HOME: /app/cache
+    volumes:
+      - bymeaudio-data:/app/data
+      - bymeaudio-model-cache:/app/cache
+    stop_grace_period: 30s
+    init: true
+
+volumes:
+  bymeaudio-data:
+  bymeaudio-model-cache:

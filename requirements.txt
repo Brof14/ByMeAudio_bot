@@ -1,10 +1,7 @@
-# ── Telegram Bot ─────────────────────────────────────────
+# Telegram client and outgoing rate limiter.
 python-telegram-bot[rate-limiter]>=20.7,<21.0
 
-# ── Распознавание речи (локально, офлайн, CPU int8) ────
-# Содержит PyAV (декодирование аудио) и silero-VAD.
-# Внешний ffmpeg и облачные API не нужны.
-faster-whisper>=1.0.0
+# Offline transcription via CTranslate2 + PyAV + Silero VAD.
+faster-whisper>=1.0.0,<2.0
 
-# ── Утилиты ─────────────────────────────────────────────
-python-dotenv>=1.0.0
+python-dotenv>=1.0,<2.0
