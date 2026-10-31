@@ -52,7 +52,7 @@ def test_container_metadata_rejects_overlong_recording():
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(16000)
-        wav.writeframes(b"\\x00\\x00" * 32000)
+        wav.writeframes(b"\x00\x00" * 32000)
 
     recognizer = Transcriber("base", 2, 0, "ru", 1)
     with pytest.raises(AudioTooLong):
