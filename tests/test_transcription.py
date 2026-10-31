@@ -25,6 +25,7 @@ def test_vad_parameters_and_exact_repetitions(monkeypatch):
     model = StubModel()
     transcriber = Transcriber("base", 2, 0, "ru", 300)
     monkeypatch.setattr(transcriber, "get_model", lambda: model)
+    monkeypatch.setattr(transcriber, "_validate_container_duration", lambda data: None)
     monkeypatch.setattr("faster_whisper.audio.decode_audio", lambda data: np.zeros(16000))
     result = transcriber.transcribe_bytes(b"audio")
     assert result.text == "Нет, нет, нет. Запись готова!"
@@ -36,7 +37,23 @@ def test_vad_parameters_and_exact_repetitions(monkeypatch):
 
 def test_rejects_long_decoded_audio_before_model_loading(monkeypatch):
     transcriber = Transcriber("base", 2, 0, None, 1)
+    monkeypatch.setattr(transcriber, "_validate_container_duration", lambda data: None)
     monkeypatch.setattr("faster_whisper.audio.decode_audio", lambda data: np.zeros(32000))
     monkeypatch.setattr(transcriber, "get_model", lambda: pytest.fail("model must not load"))
     with pytest.raises(AudioTooLong):
         transcriber.transcribe_bytes(b"audio")
+
+def test_container_metadata_rejects_overlong_recording():
+    import io
+    import wave
+
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\\x00\\x00" * 32000)
+
+    recognizer = Transcriber("base", 2, 0, "ru", 1)
+    with pytest.raises(AudioTooLong):
+        recognizer._validate_container_duration(audio.getvalue())

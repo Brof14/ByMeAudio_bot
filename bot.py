@@ -219,6 +219,11 @@ class AudioBot:
 
         detected = detect_media(message)
         if not detected:
+            if message.document:
+                await message.reply_text(
+                    "Неподдерживаемый формат. Пришлите аудио (MP3, OGG, WAV, M4A) "
+                    "или видео (MP4, MOV, MKV)."
+                )
             return
         file_obj, kind, title, icon, reported_duration = detected
         max_bytes = self.settings.max_file_size_mb * 1024 * 1024
@@ -363,7 +368,10 @@ class AudioBot:
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Uncaught update error: %s", context.error, exc_info=context.error)
+    error = context.error
+    if error:
+        logger.error("Uncaught update error: %s", error,
+                     exc_info=(type(error), error, error.__traceback__))
 
 
 def main() -> None:

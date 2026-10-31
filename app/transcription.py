@@ -53,9 +53,30 @@ class Transcriber:
         except Exception:
             logger.exception("Could not warm up the speech model")
 
+    def _validate_container_duration(self, data: bytes) -> None:
+        """Reject obviously overlong audio before allocating its decoded PCM buffer.
+
+        Container metadata may be absent or inaccurate; the decoded duration is
+        independently verified after decoding.
+        """
+        import av
+
+        with av.open(io.BytesIO(data), mode="r") as container:
+            for stream in container.streams:
+                if stream.type != "audio":
+                    continue
+                if stream.duration is not None and stream.time_base is not None:
+                    seconds = float(stream.duration * stream.time_base)
+                    if seconds > self.max_duration_seconds:
+                        raise AudioTooLong(
+                            f"Audio header duration {seconds:.0f}s exceeds "
+                            f"{self.max_duration_seconds}s limit"
+                        )
+
     def transcribe_bytes(self, data: bytes) -> Transcript:
         from faster_whisper.audio import decode_audio
 
+        self._validate_container_duration(data)
         # Validate decoded length: compressed file size alone is insufficient.
         audio = decode_audio(io.BytesIO(data))
         duration = len(audio) / 16000

@@ -29,3 +29,12 @@ jobs:
         run: ruff check .
       - name: Unit tests
         run: python -m pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose
+        run: cp .env.example .env && docker compose config --quiet
+      - name: Build container
+        run: docker build --tag bymeaudio:ci .
