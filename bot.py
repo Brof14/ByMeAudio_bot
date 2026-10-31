@@ -1,766 +1,383 @@
-import os
-import sys
-import time
-import html
-import logging
-import sqlite3
-import io
+"""Telegram entry point for ByMeAudio.
+
+Run with: python bot.py
+"""
+from __future__ import annotations
+
 import asyncio
+import html
+import io
+import logging
+import sys
 import threading
-import re
+import time
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
     AIORateLimiter,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
-from telegram.constants import ParseMode, ChatAction
-from telegram.error import Conflict, TelegramError
 
-# ══════════════════════════════════════════════════════════
-#  ЛОГИРОВАНИЕ
-# ══════════════════════════════════════════════════════════
+from app.config import Settings
+from app.formatting import format_duration, split_html_text
+from app.queueing import JobGate
+from app.storage import StatsRepository
+from app.transcription import AudioTooLong, Transcriber
 
-# ВАЖНО: httpx/telegram на уровне INFO печатали каждый getUpdates вместе
-# с токеном бота в открытом виде и раздували bot.log без ограничения.
-for _noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "apscheduler", "asyncio"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    handlers=[
-        # Ротация: лог не растёт бесконечно и не съедает диск VPS.
-        RotatingFileHandler("bot.log", maxBytes=512 * 1024, backupCount=1, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("audio_bot")
-
-# ══════════════════════════════════════════════════════════
-#  КОНФИГУРАЦИЯ
-# ══════════════════════════════════════════════════════════
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден в файле .env")
-
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-ADMIN_SET = set(ADMIN_IDS)
-
-MAX_FILE_SIZE_MB = 20  # Ограничение Telegram Bot API на getFile
-DB_PATH = "/app/data/audio_bot.db" if os.path.exists("/app/data") else "audio_bot.db"
-
-# ── Параметры распознавания (оптимизированы для скорости, точности и качества) ──
-# WHISPER_MODEL: tiny (~75 МБ, быстро) | base (~145 МБ, точнее, по умолчанию)
-# WHISPER_BEAM_SIZE: 1-3 (1 = быстро, 3 = точнее, оптимум 2-3)
-# WHISPER_CPU_THREADS: 0 = авто (число ядер VPS), вручную ограничивает нагрузку
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
-WHISPER_BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "2") or 2))
-WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0") or 0)
-
-# ══════════════════════════════════════════════════════════
-#  БАЗА ДАННЫХ
-# ══════════════════════════════════════════════════════════
-
-# Одно долгоживущее соединение вместо connect()/close() на каждый вызов:
-# меньше системных вызовов, блокировок файла и повторных PRAGMA на каждый апдейт.
-_conn: sqlite3.Connection | None = None
-
-
-def get_conn() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        db_dir = os.path.dirname(DB_PATH)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-
-        _conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")
-        _conn.execute("PRAGMA cache_size=-2000")
-    return _conn
-
-
-def init_db():
-    conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id                 INTEGER PRIMARY KEY,
-            username                TEXT,
-            first_name              TEXT,
-            total_conversions       INTEGER DEFAULT 0,
-            total_voice             INTEGER DEFAULT 0,
-            total_video             INTEGER DEFAULT 0,
-            total_audio             INTEGER DEFAULT 0,
-            created_at              TEXT    DEFAULT CURRENT_TIMESTAMP,
-            last_active             TEXT    DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-    needed_cols = {
-        "first_name": "TEXT",
-        "total_conversions": "INTEGER DEFAULT 0",
-        "total_voice": "INTEGER DEFAULT 0",
-        "total_video": "INTEGER DEFAULT 0",
-        "total_audio": "INTEGER DEFAULT 0",
-        "last_active": "TEXT",
-    }
-
-    for col_name, col_def in needed_cols.items():
-        if col_name not in existing_cols:
-            conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
-            logger.info("Миграция БД: добавлена колонка %s", col_name)
-
-    conn.execute("DROP TABLE IF EXISTS transactions")
-    conn.commit()
-    logger.info("База данных инициализирована успешно.")
-
-
-def ensure_user(user_id: int, username: str | None, first_name: str | None) -> None:
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO users (user_id, username, first_name, last_active)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name,
-            last_active = CURRENT_TIMESTAMP
-    """, (user_id, username or "", first_name or ""))
-    conn.commit()
-
-
-def record_conversion(user_id: int, username: str | None, first_name: str | None, media_type: str):
-    v_voice = 1 if media_type == "voice" else 0
-    v_video = 1 if media_type == "video" else 0
-    v_audio = 1 if media_type == "audio" else 0
-
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO users (
-            user_id, username, first_name,
-            total_conversions, total_voice, total_video, total_audio,
-            last_active
-        )
-        VALUES (?, ?, ?, 1, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name,
-            total_conversions = total_conversions + 1,
-            total_voice = total_voice + excluded.total_voice,
-            total_video = total_video + excluded.total_video,
-            total_audio = total_audio + excluded.total_audio,
-            last_active = CURRENT_TIMESTAMP
-    """, (user_id, username or "", first_name or "", v_voice, v_video, v_audio))
-    conn.commit()
-
-
-def get_user_stats(user_id: int) -> dict:
-    row = get_conn().execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    return dict(row) if row else {}
-
-
-def get_global_stats() -> dict:
-    conn = get_conn()
-    row = conn.execute("""
-        SELECT COUNT(*) AS users,
-               COALESCE(SUM(total_conversions), 0) AS total,
-               COALESCE(SUM(total_voice), 0) AS voice,
-               COALESCE(SUM(total_video), 0) AS video,
-               COALESCE(SUM(total_audio), 0) AS audio
-        FROM users
-    """).fetchone()
-    return dict(row)
-
-
-def get_all_user_ids() -> list[int]:
-    rows = get_conn().execute("SELECT user_id FROM users").fetchall()
-    return [row["user_id"] for row in rows]
-
-
-# ══════════════════════════════════════════════════════════
-#  ДВИЖОК РАСПОЗНАВАНИЯ РЕЧИ (Faster-Whisper, локально)
-# ══════════════════════════════════════════════════════════
-
-class Transcriber:
-    """
-    Локальный офлайн-транскрайбер на faster-whisper (CTranslate2, int8, CPU).
-    """
-
-    def __init__(self, model_size: str, beam_size: int, cpu_threads: int):
-        self.model_size = model_size
-        self.beam_size = beam_size
-        self.cpu_threads = cpu_threads
-        self._model = None
-        self._model_lock = threading.Lock()
-
-    def get_model(self):
-        if self._model is not None:
-            return self._model
-
-        with self._model_lock:
-            if self._model is not None:
-                return self._model
-
-            from faster_whisper import WhisperModel
-
-            t = time.perf_counter()
-            self._model = WhisperModel(
-                self.model_size,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=self.cpu_threads,
-            )
-            logger.info("Whisper '%s' (int8, cpu_threads=%d) загружена за %.2f с",
-                        self.model_size, self.cpu_threads, time.perf_counter() - t)
-            return self._model
-
-    def warmup(self):
-        try:
-            self.get_model()
-            from faster_whisper.vad import get_vad_model
-            get_vad_model()
-            logger.info("Прогрев распознавания завершён")
-        except Exception as e:
-            logger.warning("Не удалось прогреть модель: %s", e)
-
-    @staticmethod
-    def _is_hallucination(text: str) -> bool:
-        words = text.split()
-        if len(words) < 6:
-            return False
-        first = words[0].lower()
-        if len(first) > 5:
-            return False
-        return all(w.lower() == first for w in words)
-
-    @staticmethod
-    def _normalize_russian_text(text: str) -> str:
-        if not text:
-            return text
-
-        text = text.strip()
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"\s+([,.!?;:])", r"\1", text)
-        text = re.sub(r"([,.!?;:])([A-Za-zА-Яа-я])", r"\1 \2", text)
-        text = re.sub(r"([.!?])\s+([«\(\[]?)([а-яё])", lambda m: f"{m.group(1)} {m.group(2)}{m.group(3).upper()}", text)
-
-        text = re.sub(r"\.{3,}", "...", text)
-        text = re.sub(r"(\.{2,})\s+([,.!?;:])", r"\2", text)
-
-        # Удаляем слишком длинные повторения слов, которые возникают на фоне шума
-        words = text.split()
-        clean = []
-        prev = None
-        prev_count = 0
-        for w in words:
-            w_norm = w.lower()
-            if w_norm == prev:
-                prev_count += 1
-                if prev_count <= 2:
-                    clean.append(w)
-            else:
-                prev = w_norm
-                prev_count = 1
-                clean.append(w)
-
-        text = " ".join(clean)
-        text = re.sub(r"\s+([)\]}>])", r"\1", text)
-        return text.strip()
-
-    @staticmethod
-    def _collapse_short_gaps(text: str) -> str:
-        text = re.sub(r"\b(\w+)\s+(\1\s+){2,}", r"\1 ", text, flags=re.IGNORECASE)
-        return text
-
-    def transcribe_bytes(self, data: bytes) -> tuple[str, str]:
-        from faster_whisper.audio import decode_audio
-
-        model = self.get_model()
-        audio = decode_audio(io.BytesIO(data))
-        if audio.size == 0:
-            return "", "Faster-Whisper"
-
-        segments, info = model.transcribe(
-            audio,
-            beam_size=self.beam_size,
-            best_of=2,
-            temperature=[0.0, 0.1, 0.2],
-            vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": 300,
-                "max_speech_duration_s": 30,
-                "padding_duration_ms": 100,
-            },
-            condition_on_previous_text=False,
-            no_speech_threshold=0.55,
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            language="ru",
-            task="transcribe",
-        )
-
-        parts = []
-        for seg in segments:
-            if seg.no_speech_prob >= 0.65:
-                continue
-            clean = seg.text.strip()
-            if not clean:
-                continue
-            if self._is_hallucination(clean):
-                continue
-            clean = self._normalize_russian_text(clean)
-            if clean:
-                parts.append(clean)
-
-        text = " ".join(parts).strip()
-        text = self._collapse_short_gaps(text)
-        text = self._normalize_russian_text(text)
-        return text, f"Faster-Whisper {self.model_size} ({info.language})"
-
-
-transcriber = Transcriber(WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
-
-_asr_semaphore: asyncio.Semaphore | None = None
-
-
-def asr_slot() -> asyncio.Semaphore:
-    global _asr_semaphore
-    if _asr_semaphore is None:
-        _asr_semaphore = asyncio.Semaphore(1)
-    return _asr_semaphore
-
-
-# ══════════════════════════════════════════════════════════
-#  ФОРМАТИРОВАНИЕ И РАЗБИВКА СООБЩЕНИЙ
-# ══════════════════════════════════════════════════════════
-
-def split_message_text(text: str, max_chunk_size: int = 3800) -> list[str]:
-    if len(text) <= max_chunk_size:
-        return [text]
-
-    chunks = []
-    current_chunk = []
-    current_length = 0
-
-    paragraphs = text.split("\n\n")
-    for para in paragraphs:
-        para_len = len(para) + 2
-        if current_length + para_len <= max_chunk_size:
-            current_chunk.append(para)
-            current_length += para_len
-        else:
-            if current_chunk:
-                chunks.append("\n\n".join(current_chunk))
-                current_chunk = []
-                current_length = 0
-
-            if len(para) > max_chunk_size:
-                lines = para.split("\n")
-                for line in lines:
-                    if len(line) <= max_chunk_size:
-                        if current_length + len(line) + 1 <= max_chunk_size:
-                            current_chunk.append(line)
-                            current_length += len(line) + 1
-                        else:
-                            if current_chunk:
-                                chunks.append("\n".join(current_chunk))
-                                current_chunk = [line]
-                                current_length = len(line) + 1
-                            else:
-                                chunks.append(line)
-                    else:
-                        words = line.split(" ")
-                        temp = ""
-                        for word in words:
-                            if len(word) > max_chunk_size:
-                                if temp:
-                                    chunks.append(temp)
-                                    temp = ""
-                                for i in range(0, len(word), max_chunk_size):
-                                    chunks.append(word[i:i + max_chunk_size])
-                            elif len(temp) + len(word) + (1 if temp else 0) <= max_chunk_size:
-                                temp = f"{temp} {word}" if temp else word
-                            else:
-                                if temp:
-                                    chunks.append(temp)
-                                temp = word
-                        if temp:
-                            chunks.append(temp)
-            else:
-                current_chunk.append(para)
-                current_length += para_len
-
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
-
-    return chunks
-
-
-# ══════════════════════════════════════════════════════════
-#  КЛАВИАТУРЫ
-# ══════════════════════════════════════════════════════════
-
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("ℹ️ Как пользоваться", callback_data="help"),
-            InlineKeyboardButton("📊 Моя статистика", callback_data="my_stats"),
-        ],
-        [
-            InlineKeyboardButton("⚡ О возможностях бота", callback_data="about"),
-        ],
-    ])
-
-
-def kb_back_to_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("← Назад в меню", callback_data="back_to_menu")]
-    ])
-
-
-# ══════════════════════════════════════════════════════════
-#  ХЕНДЛЕРЫ — КОМАНДЫ
-# ══════════════════════════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username, user.first_name)
-
-    name = user.first_name or "друг"
-    text = (
-        f"👋 <b>Привет, {html.escape(name)}!</b>\n\n"
-        f"Я быстрый и бесплатный бот для мгновенного перевода голоса и видео в текст.\n\n"
-        f"🚀 <b>Что я умею:</b>\n"
-        f"• 🎙 <b>Голосовые сообщения</b> (.ogg)\n"
-        f"• 📹 <b>Видео-кружки</b> (.mp4)\n"
-        f"• 🎵 <b>Аудиофайлы</b> (MP3, M4A, WAV, FLAC, AAC…)\n"
-        f"• 🎬 <b>Видеофайлы</b> (извлечение звука)\n"
-        f"• ✍️ Точная расстановка знаков препинания и заглавных букв\n"
-        f"• 🆓 <b>100% бесплатно и без ограничений!</b>\n\n"
-        f"👉 <i>Просто отправь или перешли мне голосовое или кружок:</i>"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main_menu())
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        f"📖 <b>Инструкция по использованию:</b>\n\n"
-        f"1️⃣ <b>Голосовые сообщения:</b>\n"
-        f"Запишите голосовое или перешлите сообщение из любого чата — бот сразу выдаст текст.\n\n"
-        f"2️⃣ <b>Кружки (видео-сообщения):</b>\n"
-        f"Отправьте кружок — бот извлечёт аудиодорожку и расшифрует её без потери качества.\n\n"
-        f"3️⃣ <b>Аудио и видео файлы:</b>\n"
-        f"Поддерживаются файлы MP3, M4A, OGG, WAV, MP4 и др. размером до 20 МБ.\n\n"
-        f"💡 <b>Совет:</b> старайтесь говорить без сильного ветра или постороннего фонового шума для лучшего результата.\n\n"
-        f"⚡ <b>Команды:</b>\n"
-        f"/start — главное меню\n"
-        f"/help — эта инструкция\n"
-        f"/stats — ваша статистика"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    u = get_user_stats(uid)
-    is_admin = uid in ADMIN_SET
-
-    user_name = update.effective_user.first_name or "Пользователь"
-    total_conv = u.get("total_conversions", 0)
-    total_voice = u.get("total_voice", 0)
-    total_video = u.get("total_video", 0)
-    total_audio = u.get("total_audio", 0)
-    created_at = u.get("created_at", "—")
-
-    text = (
-        f"📊 <b>Статистика: {html.escape(user_name)}</b>\n\n"
-        f"🎙 Голосовых расшифровано: <b>{total_voice}</b>\n"
-        f"📹 Кружков расшифровано: <b>{total_video}</b>\n"
-        f"🎵 Аудиофайлов: <b>{total_audio}</b>\n"
-        f"📝 Всего расшифровано: <b>{total_conv}</b>\n"
-        f"📅 С нами с: <code>{created_at}</code>\n"
-        f"💎 Статус: <b>Бесплатно навсегда 🚀</b>"
-    )
-
-    if is_admin:
-        g = get_global_stats()
-        text += (
-            f"\n\n👑 <b>Админ-статистика:</b>\n"
-            f"👥 Всего пользователей: <b>{g['users']}</b>\n"
-            f"📈 Всего обработано файлов: <b>{g['total']}</b>\n"
-            f"🎙 Всего голосовых: <b>{g['voice']}</b>\n"
-            f"📹 Всего кружков: <b>{g['video']}</b>\n"
-            f"🎵 Всего аудиофайлов: <b>{g['audio']}</b>"
-        )
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
-
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_SET:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование: /broadcast <текст рассылки>")
-        return
-
-    broadcast_text = update.message.text.split(maxsplit=1)[1]
-    user_ids = get_all_user_ids()
-    await update.message.reply_text(f"📢 Начинаю рассылку для {len(user_ids)} пользователей...")
-
-    success = 0
-    failed = 0
-    for target_id in user_ids:
-        try:
-            await context.bot.send_message(chat_id=target_id, text=broadcast_text, parse_mode=ParseMode.HTML)
-            success += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-
-    await update.message.reply_text(
-        f"✅ <b>Рассылка завершена!</b>\n"
-        f"Успешно: <b>{success}</b>\n"
-        f"Не доставлено: <b>{failed}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ══════════════════════════════════════════════════════════
-#  ХЕНДЛЕРЫ — ОБРАБОТКА МЕДИА (ГОЛОС / КРУЖКИ / АУДИО)
-# ══════════════════════════════════════════════════════════
+logger = logging.getLogger("bymeaudio")
 
 AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".aac", ".oga", ".opus", ".amr", ".wma")
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg", ".3gp")
+LONG_TRANSCRIPT_THRESHOLD = 9500
 
 
-def detect_media(msg) -> dict | None:
+def setup_logging(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for name in ("httpx", "httpcore", "telegram", "telegram.ext", "apscheduler"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[
+            RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+def detect_media(msg):
     if msg.voice:
-        return dict(obj=msg.voice, kind="voice", media="voice", icon="🎙",
-                    title="Голосовое сообщение",
-                    prompt="🎧 Слушаю и перевожу голосовое в текст…",
-                    duration=msg.voice.duration or 0, size=msg.voice.file_size or 0)
+        return msg.voice, "voice", "Голосовое сообщение", "🎙", msg.voice.duration or 0
     if msg.video_note:
-        return dict(obj=msg.video_note, kind="video", media="video", icon="📹",
-                    title="Видео-сообщение (кружок)",
-                    prompt="📹 Извлекаю звук из кружка и перевожу в текст…",
-                    duration=msg.video_note.duration or 0, size=msg.video_note.file_size or 0)
+        return msg.video_note, "video_note", "Видеокружок", "📹", msg.video_note.duration or 0
     if msg.audio:
-        return dict(obj=msg.audio, kind="audio", media="audio", icon="🎵",
-                    title=f"Аудио: {msg.audio.file_name or 'Аудиозапись'}",
-                    prompt="🎵 Обрабатываю аудиофайл…",
-                    duration=msg.audio.duration or 0, size=msg.audio.file_size or 0)
+        return msg.audio, "audio", "Аудиозапись", "🎵", msg.audio.duration or 0
     if msg.video:
-        return dict(obj=msg.video, kind="video", media="video", icon="🎬",
-                    title="Видеофайл",
-                    prompt="🎬 Извлекаю звук из видео и перевожу в текст…",
-                    duration=msg.video.duration or 0, size=msg.video.file_size or 0)
+        return msg.video, "video", "Видеофайл", "🎬", msg.video.duration or 0
     if msg.document:
         doc = msg.document
         mime = (doc.mime_type or "").lower()
-        name = (doc.file_name or "").lower()
-        is_audio = mime.startswith("audio/") or name.endswith(AUDIO_EXTS)
-        is_video = mime.startswith("video/") or name.endswith(VIDEO_EXTS)
-        if not (is_audio or is_video):
-            return None
-        return dict(obj=doc, kind="doc", media="audio" if is_audio else "video",
-                    icon="🎵" if is_audio else "🎬",
-                    title=f"Файл: {doc.file_name or 'Аудио'}",
-                    prompt="📁 Извлекаю аудиодорожку из файла…",
-                    duration=getattr(doc, "duration", None) or 0, size=doc.file_size or 0)
+        filename = (doc.file_name or "").lower()
+        is_audio = mime.startswith("audio/") or filename.endswith(AUDIO_EXTS)
+        is_video = mime.startswith("video/") or filename.endswith(VIDEO_EXTS)
+        if is_audio:
+            return doc, "audio", "Аудиофайл", "🎵", 0
+        if is_video:
+            return doc, "video", "Видеофайл", "🎬", 0
     return None
 
 
-def format_duration(seconds: float | int) -> str:
-    seconds = int(round(seconds))
-    if seconds < 0:
-        seconds = 0
-    mins = seconds // 60
-    secs = seconds % 60
-    if mins >= 60:
-        hours = mins // 60
-        mins = mins % 60
-        return f"{hours}:{mins:02d}:{secs:02d}"
-    return f"{mins}:{secs:02d}"
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Как пользоваться", callback_data="help"),
+         InlineKeyboardButton("Моя статистика", callback_data="stats")],
+        [InlineKeyboardButton("Конфиденциальность", callback_data="privacy")],
+    ])
 
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    user = update.effective_user
-    if not msg or not user:
-        return
+def back_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("← Главное меню", callback_data="menu")]
+    ])
 
-    ensure_user(user.id, user.username, user.first_name)
 
-    info = detect_media(msg)
-    if info is None:
-        return
-    file_obj = info["obj"]
+WELCOME = (
+    "<b>ByMeAudio — голос и видео в текст.</b>\n\n"
+    "Отправьте голосовое сообщение, кружок, аудио или видео — "
+    "бот распознает речь и пришлёт текст.\n\n"
+    "Распознавание выполняется локально на сервере. Бесплатно."
+)
 
-    if info["size"] > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await msg.reply_text(
-            f"⚠️ <b>Файл слишком большой</b> ({info['size'] / (1024 * 1024):.1f} МБ).\n"
-            f"Telegram Bot API разрешает ботам загружать файлы до {MAX_FILE_SIZE_MB} МБ.",
-            parse_mode=ParseMode.HTML,
+HELP = (
+    "<b>Как пользоваться</b>\n\n"
+    "1. Отправьте или перешлите голосовое сообщение, кружок, аудио или видео.\n"
+    "2. Дождитесь окончания обработки — при нагрузке запрос попадёт в очередь.\n"
+    "3. Получите текст; длинную расшифровку бот отправит файлом.\n\n"
+    "Ограничения размера и длительности указаны при отправке.\n"
+    "Команды: /start, /help, /stats, /privacy, /delete_me."
+)
+PRIVACY = (
+    "<b>Конфиденциальность</b>\n\n"
+    "Аудио обрабатывается локально, без внешнего сервиса распознавания. "
+    "Бот сохраняет Telegram ID, имя, username, дату активности и счётчики обработок. "
+    "Само аудио и расшифровки в пользовательской базе не сохраняются.\n\n"
+    "Передача файлов происходит через Telegram. В технических логах могут "
+    "временно сохраняться идентификаторы запросов и сообщения об ошибках.\n"
+    "Удалить свою статистику: /delete_me."
+)
+
+
+class AudioBot:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.db = StatsRepository(settings.db_path)
+        self.db.initialize()
+        self.gate = JobGate(settings.max_pending_jobs, settings.user_cooldown_seconds)
+        self.transcriber = Transcriber(
+            settings.whisper_model,
+            settings.whisper_beam_size,
+            settings.whisper_cpu_threads,
+            settings.transcription_language,
+            settings.max_duration_seconds,
         )
-        return
 
-    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-    status_msg = await msg.reply_text(info["prompt"])
+    def remember(self, user) -> None:
+        self.db.ensure_user(user.id, user.username, user.first_name)
 
-    try:
-        tg_file = await file_obj.get_file()
-        data = await tg_file.download_as_bytearray()
-        del tg_file
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.remember(update.effective_user)
+        await update.effective_message.reply_text(
+            WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu()
+        )
 
-        t_start = time.perf_counter()
-        async with asr_slot():
-            text, engine_name = await asyncio.to_thread(transcriber.transcribe_bytes, bytes(data))
-            data = None
-        elapsed = time.perf_counter() - t_start
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(
+            HELP, parse_mode=ParseMode.HTML, reply_markup=back_menu()
+        )
 
-        if not text:
-            await status_msg.edit_text(
-                "❌ <b>Не удалось разобрать речь.</b>\n\n"
-                "Возможные причины:\n"
-                "• В записи тишина или играет только музыка\n"
-                "• Слишком сильные посторонние шумы\n"
-                "• Слишком тихий голос\n\n"
-                "Попробуйте записать ещё раз ближе к микрофону.",
-                parse_mode=ParseMode.HTML,
+    def stats_text(self, user_id: int, is_admin: bool) -> str:
+        stats = self.db.user_stats(user_id)
+        text = (
+            "<b>Моя статистика</b>\n\n"
+            f"Голосовых: <b>{stats.get('total_voice', 0)}</b>\n"
+            f"Видео и кружков: <b>{stats.get('total_video', 0)}</b>\n"
+            f"Аудиофайлов: <b>{stats.get('total_audio', 0)}</b>\n"
+            f"Всего расшифровок: <b>{stats.get('total_conversions', 0)}</b>\n"
+            f"Первое использование: <code>{stats.get('created_at', '—') or '—'}</code>"
+        )
+        if is_admin:
+            global_stats = self.db.global_stats()
+            text += (
+                "\n\n<b>Статистика сервиса</b>\n"
+                f"Пользователей: <b>{global_stats['users']}</b>\n"
+                f"Расшифровок: <b>{global_stats['total']}</b>"
+            )
+        return text
+
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        self.remember(user)
+        await update.effective_message.reply_text(
+            self.stats_text(user.id, user.id in self.settings.admin_ids),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+
+    async def privacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(
+            PRIVACY, parse_mode=ParseMode.HTML, reply_markup=back_menu()
+        )
+
+    async def delete_me(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Удалить статистику", callback_data="delete_confirm")],
+            [InlineKeyboardButton("Отмена", callback_data="menu")],
+        ])
+        await update.effective_message.reply_text(
+            "Удалить ваши имя, username и сохранённую статистику? "
+            "Это действие невозможно отменить.",
+            reply_markup=keyboard,
+        )
+
+    async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        user = query.from_user
+        if query.data == "menu":
+            await query.edit_message_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+        elif query.data == "help":
+            await query.edit_message_text(HELP, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        elif query.data == "stats":
+            self.remember(user)
+            await query.edit_message_text(
+                self.stats_text(user.id, user.id in self.settings.admin_ids),
+                parse_mode=ParseMode.HTML, reply_markup=back_menu(),
+            )
+        elif query.data == "privacy":
+            await query.edit_message_text(PRIVACY, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        elif query.data == "delete_confirm":
+            self.db.delete_user(user.id)
+            await query.edit_message_text(
+                "Сохранённая статистика удалена. При следующем использовании бот создаст новую запись.",
+                reply_markup=back_menu(),
+            )
+
+    async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if not message or not user:
+            return
+
+        detected = detect_media(message)
+        if not detected:
+            return
+        file_obj, kind, title, icon, reported_duration = detected
+        max_bytes = self.settings.max_file_size_mb * 1024 * 1024
+        if (file_obj.file_size or 0) > max_bytes:
+            await message.reply_text(
+                f"Файл превышает лимит {self.settings.max_file_size_mb} МБ."
+            )
+            return
+        if reported_duration > self.settings.max_duration_seconds:
+            await message.reply_text(
+                f"Запись слишком длинная. Максимум: "
+                f"{format_duration(self.settings.max_duration_seconds)}."
             )
             return
 
-        record_conversion(user.id, user.username, user.first_name, info["media"])
-        dur_formatted = format_duration(info["duration"])
-        stats_footer = f"⏱ {elapsed:.1f} сек | ⏳ {dur_formatted} | ⚡ {engine_name}"
+        admission = await self.gate.admit(user.id)
+        if not admission.accepted:
+            await message.reply_text(admission.message)
+            return
 
-        chunks = split_message_text(html.escape(text), max_chunk_size=3800)
-        first_text = (
-            f"{info['icon']} <b>{html.escape(info['title'])}</b>\n\n"
-            f"{chunks[0]}\n\n"
-            f"📊 <i>{stats_footer}</i>"
-        )
-
-        await status_msg.edit_text(first_text, parse_mode=ParseMode.HTML)
-
-        for chunk in chunks[1:]:
-            await msg.reply_text(chunk, parse_mode=ParseMode.HTML)
-
-        if len(text) > 10000:
-            bio = io.BytesIO(text.encode("utf-8"))
-            bio.name = f"transcript_{int(time.time())}.txt"
-            await msg.reply_document(document=bio, caption="📄 Полный текст расшифровки в файле")
-
-    except TelegramError as e:
-        logger.error("Telegram API ошибка при обработке медиа uid=%s: %s", user.id, e)
+        status = None
         try:
-            await status_msg.edit_text("❌ Ошибка отправки результата. Попробуйте ещё раз.")
+            self.remember(user)
+            status = await message.reply_text(
+                "Запись в очереди. Ожидаю свободный слот..." if admission.position
+                else "Файл получен. Подготавливаю звук..."
+            )
+            # A single processing slot covers BOTH downloading and decoding:
+            # waiting requests cannot each hold a full file in memory.
+            async with self.gate.processing_slot():
+                if admission.position:
+                    await status.edit_text("Подготавливаю звук...")
+                await context.bot.send_chat_action(
+                    chat_id=message.chat_id, action=ChatAction.TYPING
+                )
+                telegram_file = await file_obj.get_file()
+                if (telegram_file.file_size or 0) > max_bytes:
+                    await status.edit_text("Файл превышает допустимый размер.")
+                    return
+                data = await telegram_file.download_as_bytearray()
+                if len(data) > max_bytes:
+                    await status.edit_text("Файл превышает допустимый размер.")
+                    return
+                await status.edit_text("Распознаю речь. Это может занять некоторое время...")
+                started = time.perf_counter()
+                transcript = await asyncio.to_thread(
+                    self.transcriber.transcribe_bytes, bytes(data)
+                )
+                del data
+                elapsed = time.perf_counter() - started
+
+            if not transcript.text:
+                await status.edit_text(
+                    "Не удалось распознать речь. Возможно, запись содержит тишину, "
+                    "музыку или сильный шум."
+                )
+                return
+
+            footer = (
+                f"Длительность: {format_duration(transcript.duration_seconds)}"
+                f" · Обработка: {elapsed:.1f} с"
+            )
+            chunks = split_html_text(transcript.text, 3300)
+            if len(transcript.text) > LONG_TRANSCRIPT_THRESHOLD:
+                await status.edit_text(
+                    f"{icon} <b>{html.escape(title)}</b>\n\n"
+                    f"{chunks[0]}\n\n"
+                    "…\n\nПолный текст — в прикреплённом файле.\n"
+                    f"<i>{html.escape(footer)}</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+                document = io.BytesIO(transcript.text.encode("utf-8"))
+                document.name = f"bymeaudio_{int(time.time())}.txt"
+                await message.reply_document(document, caption="Полная расшифровка")
+            else:
+                await status.edit_text(
+                    f"{icon} <b>{html.escape(title)}</b>\n\n"
+                    f"{chunks[0]}\n\n<i>{html.escape(footer)}</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+                for part in chunks[1:]:
+                    await message.reply_text(part, parse_mode=ParseMode.HTML)
+
+            # Count an operation only after all output was delivered.
+            self.db.record_conversion(user.id, user.username, user.first_name, kind)
+            logger.info("Transcription delivered uid=%s kind=%s seconds=%.1f",
+                        user.id, kind, transcript.duration_seconds)
+        except AudioTooLong:
+            if status:
+                await self._safe_status(status, "Аудио слишком длинное для обработки.")
+        except TelegramError:
+            logger.exception("Telegram delivery/download error uid=%s", user.id)
+            if status:
+                await self._safe_status(status, "Не удалось загрузить или отправить файл. Повторите попытку.")
         except Exception:
-            pass
-    except Exception:
-        logger.exception("Непредвиденная ошибка при обработке медиа uid=%s", user.id)
+            logger.exception("Transcription error uid=%s", user.id)
+            if status:
+                await self._safe_status(status, "Ошибка обработки аудио. Повторите попытку позже.")
+        finally:
+            await self.gate.release(user.id)
+
+    @staticmethod
+    async def _safe_status(message, text: str) -> None:
         try:
-            await status_msg.edit_text("❌ Произошла ошибка при обработке файла. Попробуйте ещё раз.")
-        except Exception:
-            pass
+            await message.edit_text(text)
+        except TelegramError:
+            logger.warning("Could not edit failed request status")
 
-
-# ══════════════════════════════════════════════════════════
-#  ХЕНДЛЕРЫ — CALLBACK (КНОПКИ МЕНЮ)
-# ══════════════════════════════════════════════════════════
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    user = q.from_user
-
-    if data == "back_to_menu":
-        text = (
-            f"👋 <b>Главное меню</b>\n\n"
-            f"Отправьте мне любое голосовое сообщение, видео-кружок или аудиофайл — "
-            f"и я мгновенно переведу его в текст.\n\n"
-            f"Бот полностью бесплатный и без ограничений! 🚀"
+    async def broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user.id not in self.settings.admin_ids:
+            return
+        if not context.args:
+            await update.effective_message.reply_text("Использование: /broadcast <текст>")
+            return
+        content = update.effective_message.text.split(maxsplit=1)[1]
+        if len(content) > 4096:
+            await update.effective_message.reply_text("Текст рассылки превышает лимит Telegram.")
+            return
+        recipients = self.db.user_ids()
+        await update.effective_message.reply_text(
+            f"Начинаю отправку {len(recipients)} пользователям."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main_menu())
-        return
-
-    elif data == "help":
-        text = (
-            f"📖 <b>Как пользоваться ботом:</b>\n\n"
-            f"1️⃣ <b>Голосовые:</b> запишите или перешлите аудиосообщение.\n"
-            f"2️⃣ <b>Кружки:</b> отправьте видео-сообщение (кружок) — звук автоматически извлечётся.\n"
-            f"3️⃣ <b>Аудиофайлы:</b> отправьте MP3, WAV, M4A, OGG и др. (до 20 МБ).\n\n"
-            f"✨ Текст формируется со знаками препинания и заглавными буквами.\n"
-            f"🆓 Без подписок, счетов и ограничений."
+        success = failed = 0
+        for recipient in recipients:
+            try:
+                # Plain text: arbitrary input must not be parsed as HTML.
+                await context.bot.send_message(chat_id=recipient, text=content)
+                success += 1
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 0.5)
+                try:
+                    await context.bot.send_message(chat_id=recipient, text=content)
+                    success += 1
+                except TelegramError:
+                    failed += 1
+            except TelegramError:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await update.effective_message.reply_text(
+            f"Рассылка завершена. Отправлено: {success}. Ошибок: {failed}."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
-        return
-
-    elif data == "my_stats":
-        u = get_user_stats(user.id)
-        text = (
-            f"📊 <b>Ваша статистика:</b>\n\n"
-            f"🎙 Голосовых: <b>{u.get('total_voice', 0)}</b>\n"
-            f"📹 Кружков: <b>{u.get('total_video', 0)}</b>\n"
-            f"🎵 Аудиофайлов: <b>{u.get('total_audio', 0)}</b>\n"
-            f"📝 Всего переведено: <b>{u.get('total_conversions', 0)}</b>\n"
-            f"📅 Дата первого запуска: <code>{u.get('created_at', '—')}</code>\n\n"
-            f"💎 Тариф: <b>Бесплатный навсегда 🚀</b>"
-        )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
-        return
-
-    elif data == "about":
-        text = (
-            f"⚡ <b>О возможностях бота:</b>\n\n"
-            f"• 🧠 <b>Движок распознавания:</b> Faster-Whisper {WHISPER_MODEL} (локально, офлайн)\n"
-            f"• 🎙 <b>Поддержка голоса:</b> OGG, OPUS, MP3, WAV, M4A, AAC, FLAC\n"
-            f"• 📹 <b>Поддержка видео:</b> Telegram видео-сообщения (кружки), MP4, MOV\n"
-            f"• ✍️ <b>Качество:</b> автоматическая расстановка запятых, точек и заглавных букв\n"
-            f"• ⚡ <b>Скорость:</b> звук декодируется прямо из файла, без конвертаций\n"
-            f"• 🆓 <b>Полная свобода:</b> никаких подписок, оплат и лимитов!"
-        )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
-        return
 
 
-# ══════════════════════════════════════════════════════════
-#  ОБРАБОТКА ОШИБОК
-# ══════════════════════════════════════════════════════════
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if isinstance(context.error, Conflict):
-        logger.warning("Конфликт getUpdates: возможно запущен другой экземпляр бота.")
-        return
-    logger.error("Необработанное исключение:", exc_info=context.error)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Uncaught update error: %s", context.error, exc_info=context.error)
 
 
-# ══════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА (MAIN)
-# ══════════════════════════════════════════════════════════
+def main() -> None:
+    load_dotenv()
+    settings = Settings.from_env()
+    setup_logging(settings.log_path)
+    service = AudioBot(settings)
+    threading.Thread(
+        target=service.transcriber.warmup, daemon=True, name="whisper-warmup"
+    ).start()
 
-def main():
-    init_db()
-    threading.Thread(target=transcriber.warmup, daemon=True, name="whisper_warmup").start()
-
-    application = (
+    app = (
         ApplicationBuilder()
-        .token(BOT_TOKEN)
+        .token(settings.bot_token)
         .rate_limiter(AIORateLimiter(overall_max_rate=30, overall_time_period=1, max_retries=3))
         .concurrent_updates(8)
         .read_timeout(60)
@@ -769,43 +386,35 @@ def main():
         .pool_timeout(30)
         .build()
     )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("stats", stats_cmd))
-    application.add_handler(CommandHandler("broadcast", broadcast_cmd))
-
-    media_filter = (
-        filters.VOICE
-        | filters.VIDEO_NOTE
-        | filters.AUDIO
-        | filters.VIDEO
-        | filters.Document.AUDIO
-        | filters.Document.VIDEO
+    private = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", service.start, filters=private))
+    app.add_handler(CommandHandler("help", service.help, filters=private))
+    app.add_handler(CommandHandler("stats", service.stats, filters=private))
+    app.add_handler(CommandHandler("privacy", service.privacy, filters=private))
+    app.add_handler(CommandHandler("delete_me", service.delete_me, filters=private))
+    app.add_handler(CommandHandler("broadcast", service.broadcast, filters=private))
+    media = (
+        filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO
+        | filters.VIDEO | filters.Document.ALL
     )
-    application.add_handler(MessageHandler(media_filter, handle_media))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_error_handler(error_handler)
-
-    logger.info("🚀 Бот успешно настроен и готов к работе!")
-    logger.info("Администраторы: %s | Модель: %s (beam=%d, cpu_threads=%d)",
-                ADMIN_IDS, WHISPER_MODEL, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS)
-
-    allowed_updates = [
-        "message", "callback_query", "my_chat_member", "chat_member",
-        "chat_join_request", "poll", "poll_answer",
-    ]
-
+    app.add_handler(MessageHandler(media & private, service.handle_media))
+    app.add_handler(CallbackQueryHandler(service.callback))
+    app.add_error_handler(on_error)
+    logger.info("ByMeAudio configured: model=%s, max_pending=%s",
+                settings.whisper_model, settings.max_pending_jobs)
     try:
-        application.run_polling(allowed_updates=allowed_updates, drop_pending_updates=True)
+        # Do not silently discard messages received during a brief restart.
+        app.run_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=False,
+        )
     except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем")
-    except Exception as e:
-        err_msg = str(e)
-        if "Unauthorized" in err_msg or "InvalidToken" in err_msg:
-            logger.error("❌ Ошибка авторизации: проверьте BOT_TOKEN в файле .env (получите токен у @BotFather)")
-        else:
-            logger.exception("Критическая ошибка работы бота: %s", e)
+        logger.info("Stopped by user")
+    except Exception:
+        logger.exception("Fatal bot error")
+        raise  # A non-zero exit status enables service supervisors to restart.
+    finally:
+        service.db.close()
 
 
 if __name__ == "__main__":
