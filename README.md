@@ -1,64 +1,118 @@
 # ByMeAudio Bot
 
-A Telegram bot that transcribes voice messages, video notes, audio files, and video files with **Faster-Whisper** running locally on the bot host.
+Telegram bot for converting voice messages, video notes, audio, and video files into text.
+Speech recognition runs **locally** through Faster-Whisper (CPU, int8). User recordings
+are **not uploaded to an external transcription service**. Telegram still handles
+transporting files to the bot.
 
 ## Features
 
-- Accepts Telegram voice messages, video notes, common audio formats, and video files with an audio track.
-- Runs transcription locally on CPU using Faster-Whisper and CTranslate2; audio is not sent to an external transcription API.
-- Splits long transcripts into Telegram-sized messages.
-- Handles transcription outside the update loop so the bot can continue responding to commands.
-- Provides per-user usage statistics with `/stats`; administrator commands include broadcasts.
+- Supports Telegram voice messages, video notes, audio/video, and supported document uploads.
+- Local Russian transcription by default; optional automatic language detection.
+- Bounded in-memory queue, one request per user, and one active CPU transcription.
+- Validation of file size and decoded audio duration; no unlimited RAM-holding queue.
+- Lossless splitting into Telegram-sized HTML-safe messages.
+- Long transcripts (over 9,500 characters) delivered as text-file attachments.
+- SQLite statistics, non-destructive schema migrations and optional deletion of personal statistics.
+- Private-chat-only processing by default; administrator broadcasts.
 
-The default model and performance depend on your server's CPU and memory. This is a self-hosted project, not a hosted service or an uptime guarantee.
+## Quick start (Docker Compose)
 
-## Requirements
+Requirements: Docker Engine and Docker Compose plugin.
 
-- Python 3.10+
-- Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Docker and Docker Compose for the container deployment
-
-## Run with Docker Compose
-
-```sh
+```bash
+git clone https://github.com/Brof14/ByMeAudio_bot.git
+cd ByMeAudio_bot
 cp .env.example .env
-```
-
-Set `BOT_TOKEN` and `ADMIN_IDS` in `.env`, then:
-
-```sh
+# Edit .env and set BOT_TOKEN (required) and ADMIN_IDS (optional).
 chmod 600 .env
 docker compose up -d --build
 docker compose logs -f bot
 ```
 
-The Compose setup keeps the SQLite database and downloaded model cache in Docker volumes. To stop the bot:
+The first start downloads a Whisper model, which can take a while. The named Docker
+volumes `bymeaudio-data` and `bymeaudio-model-cache` persist the SQLite file and model
+cache. **Do not run `docker compose down -v` unless you intend to delete volumes.**
 
-```sh
-docker compose down
+To upgrade after pulling changes:
+
+```bash
+git pull --ff-only
+docker compose up -d --build
 ```
 
-For local development, create a virtual environment, install `requirements.txt`, configure `.env`, and run `python bot.py`. See the Compose file and `.env.example` for the configuration supported by this checkout.
+### Migrating an existing SQLite database
 
-## Bot commands
+If the bot previously ran without Docker, **stop it**, back up `audio_bot.db`
+together with any SQLite `-wal` or `-shm` files if present, and either:
 
-| Command | Description |
-| --- | --- |
-| `/start` | Open the main menu |
-| `/help` | Show usage instructions |
-| `/stats` | Show usage statistics |
-| `/broadcast <text>` | Send an announcement (administrators only) |
+1. Keep using local Python with `DB_PATH` pointing to the existing database; or
+2. Copy the database into the container's persistent `/app/data/audio_bot.db` volume
+   **while the service is stopped**.
 
-## Configuration
+Do not start a second polling process with the same Telegram token. Initialisation
+preserves legacy `transactions` and existing user statistics.
 
-- `BOT_TOKEN` — required Telegram bot token
-- `ADMIN_IDS` — comma-separated Telegram user IDs with administrator access
-- `WHISPER_MODEL` — transcription model; the repository default is `base`
-- `WHISPER_BEAM_SIZE` — decoding beam size
-- `WHISPER_CPU_THREADS` — CPU thread count; `0` selects automatically
+## Local Python
 
-Never commit `.env`. If a real bot token was ever committed or shared, revoke it through BotFather and issue a replacement.
+Requires Python 3.11+, and enough memory for the chosen Whisper model.
 
-## Notes
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Configure BOT_TOKEN.
+python bot.py
+```
 
-Transcription quality and latency vary with the model, language, audio quality, and server hardware. Obtain permission before processing other people's recordings and follow Telegram's rules and applicable privacy requirements.
+On Windows PowerShell use `.venv\\Scripts\\Activate.ps1` instead of `source`.
+
+## Environment variables
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BOT_TOKEN` | Required | Token from BotFather |
+| `ADMIN_IDS` | Empty | Comma-separated Telegram user IDs |
+| `WHISPER_MODEL` | `base` | Tiny is faster, small can be more accurate |
+| `WHISPER_BEAM_SIZE` | `2` | 1 to 10 |
+| `WHISPER_CPU_THREADS` | `0` | 0 = automatic |
+| `TRANSCRIPTION_LANGUAGE` | `ru` | Use `auto` for language identification |
+| `MAX_FILE_SIZE_MB` | `20` | Max 20 MiB for standard Telegram Bot API |
+| `MAX_DURATION_SECONDS` | `900` | Max decoded recording length, 30 to 3600 seconds |
+| `MAX_PENDING_JOBS` | `4` | Includes processing and queued requests |
+| `USER_COOLDOWN_SECONDS` | `3` | Delay before accepting another request |
+| `DB_PATH` | `data/audio_bot.db` | Docker overrides to persistent volume |
+| `LOG_PATH` | `bot.log` | Docker overrides to persistent volume |
+
+`GROQ_API_KEY` is intentionally not supported: no Groq transcription path
+exists in the application. Avoid setting it.
+
+## Commands
+
+`/start`: instructions, menu; `/help`: usage; `/stats`: usage totals;
+`/privacy`: privacy details; `/delete_me`: delete personal statistics
+after confirmation; `/broadcast <text>`: private administrator announcement.
+
+## Operations
+
+- The default in-memory queue is intentionally **not persistent**. Running tasks
+  interrupted by a process restart are not automatically resumed, although pending
+  Telegram updates are no longer deliberately dropped.
+- Only run one polling instance per token. SQLite is suitable for a small bot.
+- `python -m pip install -r requirements-dev.txt && python -m pytest -q && ruff check .`
+  runs the CI checks. Tests stub recognition; they do **not** download a model.
+- Backup the SQLite database using the SQLite backup API, not a plain copy of a
+  live WAL-enabled database. Backup the named volume to external storage.
+- If the bot serves a large audience, consider a durable job queue and a
+  separately managed worker before increasing concurrency.
+- No benchmarked transcription latency or accuracy is guaranteed. CPU and RAM
+  requirements depend on model selection and recording duration.
+
+## Privacy and limits
+
+Only Telegram ID, username, first name, timestamps, and usage counters are
+stored in the database. Audio and transcript text are processed transiently and
+not saved in that database. Some user IDs/errors can appear in rotated
+operational logs. Users can remove their profile with `/delete_me`. Be mindful
+of local privacy laws and obtain consent for other people's recordings.
